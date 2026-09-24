@@ -1,0 +1,36 @@
+#include <windows.h>
+
+1 ICON "icon.ico"
+
+/* 待安装的程序本体，由 CMake 在构建前拷进来 */
+3 RCDATA "payload.exe"
+
+1 24 "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "A.C.O.C."
+            VALUE "FileDescription",  "A.C.O.C. 点名系统配置器 安装程序"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "ACOCConfiguratorSetup"
+            VALUE "OriginalFilename", "ACOCConfiguratorSetup.exe"
+            VALUE "ProductName",      "A.C.O.C. 点名系统配置器"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

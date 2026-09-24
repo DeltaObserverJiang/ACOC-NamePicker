@@ -1,0 +1,36 @@
+#include <windows.h>
+
+1 ICON "icon.ico"
+
+/* 点名器源码模板，编译进 exe，配置器靠它生成最终页面 */
+2 RCDATA "template.html"
+
+1 24 "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "A.C.O.C."
+            VALUE "FileDescription",  "A.C.O.C. 点名系统配置器"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "ACOCConfigurator"
+            VALUE "OriginalFilename", "ACOCConfigurator.exe"
+            VALUE "ProductName",      "A.C.O.C. 点名系统配置器"
+            VALUE "ProductVersion",   "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

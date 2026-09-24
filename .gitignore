@@ -1,0 +1,26 @@
+# 构建产物
+build/
+dist/
+
+# 由构建过程写进资源目录的载荷
+configurator/installer/res/payload.exe
+
+# 无头浏览器配置、Python 缓存
+_cdp_profile/
+__pycache__/
+
+# 测试跑出来的中间文件（_test/roster 下的表格样本是样例数据，要留着）
+configurator/_test/*.html
+configurator/_test/*.png
+configurator/_test/*.json
+configurator/_test/*.exe
+configurator/_test/_*.txt
+
+# 早期做功能裁剪实验时留下的临时文件
+_*.html
+_*.js
+_*.txt
+
+# 编辑器与会话数据
+.claude/
+memory/
