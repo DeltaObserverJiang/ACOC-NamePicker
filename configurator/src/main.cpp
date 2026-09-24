@@ -981,7 +981,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
             // 版本号放标题条右端，下面那行留给导出按钮
             RECT ver = {rc.right - S(130), S(20), rc.right - S(24), S(44)};
-            DrawTextC(dc, L"v0.2", ver, kMuted, g_fSmall,
+            DrawTextC(dc, L"v0.2.1", ver, kMuted, g_fSmall,
                       DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
             EndPaint(h, &ps);

@@ -85,12 +85,23 @@ for p in leftovers():
         pass
 if os.path.isdir(INSTALL):
     shutil.rmtree(INSTALL, ignore_errors=True)
+# 注册表也要清，否则下面的等待条件一上来就成立
+try:
+    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, REG)
+except FileNotFoundError:
+    pass
 time.sleep(0.5)
 
 print("=== 安装 ===")
 proc = subprocess.Popen([SETUP], cwd=os.path.dirname(SETUP))
 time.sleep(2.5)
 print(ps(TOOLS, "-Click", 104).strip())
+# 安装过程被强制拉到两秒以上，等文件真正落地再断言
+def installed_ready():
+    return os.path.isfile(os.path.join(INSTALL, "ACOCConfigurator.exe")) and            os.path.isfile(os.path.join(INSTALL, "uninstall.exe"))
+deadline = time.time() + 25
+while time.time() < deadline and not installed_ready():
+    time.sleep(0.3)
 print(ps(DISMISS, "-TargetPid", proc.pid).strip())
 check("安装目录已创建", os.path.isdir(INSTALL))
 if os.path.isdir(INSTALL):

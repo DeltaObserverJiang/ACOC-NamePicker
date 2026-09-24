@@ -1,5 +1,5 @@
-# 覆盖安装流程：没装过时不该弹框，装过之后要先问一句，
-# 选“否”能干净退回，选“是”才继续。
+# v0.2.1 的覆盖安装流程：没装过时直接装，装过之后先切到界面内的确认页
+# （按钮变成“覆盖安装”），确认后才动手。顺便量一下安装耗时是否够两秒。
 import ctypes
 import ctypes.wintypes as wt
 import os
@@ -15,8 +15,12 @@ INSTALL = os.path.join(os.environ["LOCALAPPDATA"], r"Programs\ACOCConfigurator")
 REG = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ACOCConfigurator"
 TITLE = "安装 A.C.O.C. 点名系统配置器"
 
-kInstallBtn, kCancelBtn = 104, 105
-IDYES, IDNO = 6, 7
+kInstallBtn, kCancelBtn, kStatus = 104, 105, 108
+
+class RECT(ctypes.Structure):
+    _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                ("r", ctypes.c_long), ("b", ctypes.c_long)]
+
 
 fails = []
 
@@ -25,11 +29,6 @@ def check(label, ok, extra=""):
     print(("  OK   " if ok else "  FAIL ") + label + ("  " + extra if extra else ""))
     if not ok:
         fails.append(label)
-
-
-class RECT(ctypes.Structure):
-    _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
-                ("r", ctypes.c_long), ("b", ctypes.c_long)]
 
 
 def find_window(pid, cls, title=None):
@@ -59,65 +58,52 @@ def find_window(pid, cls, title=None):
     return found[0] if found else None
 
 
-def dlg_text(dlg):
-    """对话框正文：遍历直接子控件里的静态文本"""
-    parts = []
-    buf = ctypes.create_unicode_buffer(2048)
-    u32.GetWindowTextW(dlg, buf, 2048)
-    parts.append(buf.value)
-
-    @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
-    def cb(h, l):
-        t = ctypes.create_unicode_buffer(2048)
-        u32.GetWindowTextW(h, t, 2048)
-        if t.value:
-            parts.append(t.value)
-        return True
-
-    u32.EnumChildWindows(dlg, cb, 0)
-    return "\n".join(parts)
-
-
-def wait_dialog(pid, timeout=6.0):
-    end = time.time() + timeout
-    while time.time() < end:
-        d = find_window(pid, "#32770")
-        if d:
-            time.sleep(0.3)  # 等文字画全
-            return d
-        time.sleep(0.15)
-    return None
-
-
-def answer(dlg, ctrl_id):
-    u32.SendMessageW(dlg, 0x0111, ctrl_id, 0)  # WM_COMMAND
-    time.sleep(0.6)
+def text_of(hwnd, ctrl_id):
+    h = u32.GetDlgItem(hwnd, ctrl_id)
+    if not h:
+        return ""
+    n = u32.GetWindowTextLengthW(h)
+    b = ctypes.create_unicode_buffer(n + 2)
+    u32.GetWindowTextW(h, b, n + 2)
+    return b.value
 
 
 def click(main, ctrl_id):
-    """必须用 PostMessage：BM_CLICK 是同步的，而按钮处理函数里会弹模态框，
-    用 SendMessage 会当场死锁——本线程卡在等待里，没法再去点那个对话框。"""
-    c = u32.GetDlgItem(main, ctrl_id)
-    u32.PostMessageW(c, 0x00F5, 0, 0)  # BM_CLICK
-    time.sleep(2.0)
+    """必须 PostMessage：BM_CLICK 是同步的，处理函数里若弹窗会当场死锁。"""
+    u32.PostMessageW(u32.GetDlgItem(main, ctrl_id), 0x00F5, 0, 0)
+
+
+def uncheck(main, ctrl_id):
+    u32.SendMessageW(u32.GetDlgItem(main, ctrl_id), 0x00F1, 0, 0)  # BM_SETCHECK
+
+
+def close_finish(main):
+    """完成页默认勾着“立即运行”，不取消的话真会把配置器拉起来，
+    下一轮覆盖安装就写不进正在运行的 exe。测试里统一取消。"""
+    uncheck(main, 106)
+    click(main, kInstallBtn)
+    time.sleep(1.5)
+
+
+def kill_app():
+    subprocess.run(["taskkill", "/F", "/IM", "ACOCConfigurator.exe"],
+                   capture_output=True)
+    time.sleep(0.5)
+
+
+def wait_btn(main, want, timeout=8.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if text_of(main, kInstallBtn) == want:
+            return True
+        time.sleep(0.1)
+    return False
 
 
 def launch():
     p = subprocess.Popen([SETUP], cwd=os.path.dirname(SETUP))
     time.sleep(2.5)
     return p
-
-
-def close_setup(pid):
-    for _ in range(4):
-        d = find_window(pid, "#32770")
-        if d:
-            answer(d, IDYES)
-        m = find_window(pid, "AcocSetup")
-        if not m:
-            return
-        click(m, kInstallBtn if _ else kCancelBtn)
-    time.sleep(0.5)
 
 
 def stored_version():
@@ -133,9 +119,33 @@ def set_stored_version(v):
     winreg.SetValueEx(k, "DisplayVersion", 0, winreg.REG_SZ, v)
 
 
+def dismiss_done(pid, main):
+    """卸载完会弹一个模态框。合成消息对它无效，只能真点。"""
+    end = time.time() + 8
+    while time.time() < end:
+        d = find_window(pid, "#32770")
+        if d:
+            btn = u32.GetDlgItem(d, 2) or u32.GetDlgItem(d, 1)
+            if btn:
+                r = RECT()
+                u32.GetWindowRect(btn, ctypes.byref(r))
+                u32.SetForegroundWindow(d)
+                time.sleep(0.25)
+                u32.SetCursorPos((r.l + r.r) // 2, (r.t + r.b) // 2)
+                time.sleep(0.2)
+                u32.mouse_event(0x0002, 0, 0, 0, 0)
+                time.sleep(0.06)
+                u32.mouse_event(0x0004, 0, 0, 0, 0)
+                time.sleep(0.4)
+            return True
+        time.sleep(0.15)
+    return False
+
+
 print("=== 清干净 ===")
 subprocess.run(["taskkill", "/F", "/IM", "ACOCConfiguratorSetup.exe"],
                capture_output=True)
+kill_app()
 if os.path.isdir(INSTALL):
     shutil.rmtree(INSTALL, ignore_errors=True)
 try:
@@ -144,71 +154,66 @@ except FileNotFoundError:
     pass
 time.sleep(0.5)
 
-print("=== 第一次安装：不该弹询问框 ===")
+print("=== 首次安装：不该出现确认页，且耗时至少两秒 ===")
 p = launch()
 main = find_window(p.pid, "AcocSetup", TITLE)
 check("安装窗口已出现", main is not None)
+t0 = time.time()
 click(main, kInstallBtn)
-d = find_window(p.pid, "#32770")
-check("首次安装没有多问", d is None, "(出现了一个对话框)" if d else "")
-if d:
-    answer(d, IDYES)
-check("已写入注册表", stored_version() == "0.2.0", str(stored_version()))
-close_setup(p.pid)
-time.sleep(0.8)
+ok = wait_btn(main, "完成", timeout=15)
+elapsed = time.time() - t0
+check("安装已完成", ok, "%.2f 秒" % elapsed)
+check("耗时不少于两秒", elapsed >= 2.0, "实测 %.2f 秒" % elapsed)
+check("没有弹出确认页（按钮直接走到完成）", ok)
+check("写入注册表 0.2.1", stored_version() == "0.2.1", str(stored_version()))
+close_finish(main)
+kill_app()
 
-print("=== 第二次安装：应询问是否覆盖 ===")
+print("=== 再装一次：应切到界面内的确认页 ===")
 p = launch()
 main = find_window(p.pid, "AcocSetup", TITLE)
 click(main, kInstallBtn)
-d = wait_dialog(p.pid)
-check("弹出了询问框", d is not None)
-if d:
-    txt = dlg_text(d)
-    check("正文说明了已装版本", "v0.2.0" in txt, repr(txt[:160]))
-    answer(d, IDNO)
-    time.sleep(0.6)
-    main2 = find_window(p.pid, "AcocSetup", TITLE)
-    check("选“否”后窗口还在，退回选项页", main2 is not None)
-    st = ctypes.create_unicode_buffer(200)
-    u32.GetWindowTextW(u32.GetDlgItem(main2, 108), st, 200)
-    check("状态栏提示已取消", "取消" in st.value, repr(st.value))
-
-    click(main2, kInstallBtn)
-    d2 = wait_dialog(p.pid)
-    check("再次弹出询问框", d2 is not None)
-    if d2:
-        answer(d2, IDYES)
-check("覆盖后版本仍是 0.2.0", stored_version() == "0.2.0", str(stored_version()))
+seen = wait_btn(main, "覆盖安装", timeout=6)
+check("按钮变成“覆盖安装”（确认页出现）", seen)
+check("取消按钮变成“返回”", text_of(main, kCancelBtn) == "返回",
+      repr(text_of(main, kCancelBtn)))
+check("确认页没有弹窗打断", find_window(p.pid, "#32770") is None)
+if seen:
+    click(main, kCancelBtn)          # 返回
+    back = wait_btn(main, "安装", timeout=4)
+    check("点“返回”回到选项页", back)
+    check("返回后按钮文字复原为“取消”", text_of(main, kCancelBtn) == "取消")
+    click(main, kInstallBtn)         # 再进确认页
+    check("再次进入确认页", wait_btn(main, "覆盖安装", timeout=4))
+    click(main, kInstallBtn)         # 覆盖安装
+    check("覆盖后完成", wait_btn(main, "完成", timeout=15))
+check("覆盖后版本仍为 0.2.1", stored_version() == "0.2.1", str(stored_version()))
 check("程序文件在位",
       os.path.isfile(os.path.join(INSTALL, "ACOCConfigurator.exe")))
-close_setup(p.pid)
-time.sleep(0.8)
+close_finish(main)
+kill_app()
 
-print("=== 模拟 v0.1 旧版：应显示 0.1 ===")
+print("=== 模拟 v0.1 旧版：确认页仍应出现 ===")
 set_stored_version("1.0.0")
 p = launch()
-main = find_window(p.id if False else p.pid, "AcocSetup", TITLE)
+main = find_window(p.pid, "AcocSetup", TITLE)
 click(main, kInstallBtn)
-d = wait_dialog(p.pid)
-check("弹出了询问框", d is not None)
-if d:
-    txt = dlg_text(d)
-    check("旧版的 1.0.0 显示为 v0.1", "v0.1" in txt, repr(txt[:160]))
-    answer(d, IDNO)
-close_setup(p.pid)
+check("检测到旧版，进入确认页", wait_btn(main, "覆盖安装", timeout=6))
+click(main, kCancelBtn)
 time.sleep(0.5)
+u32.PostMessageW(main, 0x0010, 0, 0)   # WM_CLOSE
+time.sleep(1.0)
 
 print("=== 收尾：卸载 ===")
 up = subprocess.Popen([os.path.join(INSTALL, "uninstall.exe")], cwd=INSTALL)
-time.sleep(2.0)
+time.sleep(2.5)
 main = find_window(up.pid, "AcocSetup")
 if main:
     click(main, kInstallBtn)
-    d = wait_dialog(up.pid)
-    if d:
-        answer(d, IDYES)   # “卸载完成”只有一个确定
-time.sleep(6)
+    dismiss_done(up.pid, main)
+deadline = time.time() + 30
+while time.time() < deadline and os.path.isdir(INSTALL):
+    time.sleep(0.5)
 check("安装目录已清除", not os.path.isdir(INSTALL))
 check("注册表项已清除", stored_version() is None)
 
