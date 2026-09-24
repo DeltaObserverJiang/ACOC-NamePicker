@@ -16,7 +16,7 @@ namespace {
 constexpr int kResApp = 3;
 
 const wchar_t* kAppName = L"A.C.O.C. 点名系统配置器";
-const wchar_t* kVersion = L"1.0.0";
+const wchar_t* kVersion = L"0.2.0";
 const wchar_t* kPublisher = L"A.C.O.C.";
 const wchar_t* kExeName = L"ACOCConfigurator.exe";
 const wchar_t* kUninstName = L"uninstall.exe";
@@ -47,6 +47,18 @@ HBRUSH g_bg, g_band;
 std::wstring g_installDir;
 bool g_uninstallMode = false;
 int g_page = 0;  // 0 选项 1 进行中 2 完成
+
+// ---------- 动效状态 ----------
+
+int g_hoverBtn = 0;        // 鼠标停在哪个按钮上（控件 id）
+int g_progressPos = 0;     // 进度条显示值，用计时器缓动到这个数
+int g_progressTarget = 0;
+double g_fadeT = 1.0;      // 完成页文字滑入的进度 0→1
+
+constexpr UINT_PTR kTimerProgress = 1;
+constexpr UINT_PTR kTimerFade = 2;
+constexpr UINT kProgressMs = 350;
+constexpr UINT kFadeMs = 200;
 
 const COLORREF kInk = RGB(0x22, 0x25, 0x2e);
 const COLORREF kMuted = RGB(0x74, 0x7a, 0x89);
@@ -229,6 +241,29 @@ void WriteUninstallEntry(const std::wstring& dir, DWORD sizeKb) {
     RegCloseKey(k);
 }
 
+// 读回已安装的版本与位置。返回 false 表示注册表里没有这台机器的安装记录。
+bool InstalledVersion(std::wstring& ver, std::wstring& loc) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRegKey, 0, KEY_READ, &k) !=
+        ERROR_SUCCESS)
+        return false;
+    auto rd = [&](const wchar_t* name, std::wstring& out) {
+        wchar_t buf[MAX_PATH] = L"";
+        DWORD cb = sizeof(buf), type = 0;
+        if (RegQueryValueExW(k, name, nullptr, &type,
+                             reinterpret_cast<BYTE*>(buf), &cb) == ERROR_SUCCESS &&
+            type == REG_SZ)
+            out = buf;
+    };
+    rd(L"DisplayVersion", ver);
+    rd(L"InstallLocation", loc);
+    RegCloseKey(k);
+    // v0.1 出厂时资源里的版本号写的是占位的 1.0.0，读回来直接显示会
+    // 和“初版是 v0.1”对不上，这里归一化一下
+    if (ver == L"1.0.0" || ver == L"1.0.0.0") ver = L"0.1";
+    return true;
+}
+
 // ---------- 安装 / 卸载 ----------
 
 bool DoInstall(std::string& err) {
@@ -388,8 +423,18 @@ HWND Mk(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int 
     return c;
 }
 
+// 进度条不直接跳，用计时器缓动过去
+void SetProgress(int pos) {
+    g_progressTarget = pos;
+    if (g_progressPos == pos) return;
+    if (g_main) SetTimer(g_main, kTimerProgress, 15, nullptr);
+}
+
 void SetPage(int page) {
     g_page = page;
+    // 完成页的文字滑入
+    g_fadeT = (page == 2) ? 0.0 : 1.0;
+    if (page == 2 && g_main) SetTimer(g_main, kTimerFade, 15, nullptr);
     const bool opt = (page == 0);
     // 卸载时没有安装位置和快捷方式可挑，所以这些控件只在安装流程里露脸
     const bool installOpts = opt && !g_uninstallMode;
@@ -410,6 +455,33 @@ void SetPage(int page) {
     SetWindowTextW(g_installBtn,
                    page == 2 ? L"完成" : (g_uninstallMode ? L"卸载" : L"安装"));
     InvalidateRect(g_main, nullptr, TRUE);
+}
+
+// 给按钮挂悬停跟踪，原窗口过程存在 GWLP_USERDATA 里
+LRESULT CALLBACK HoverProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    WNDPROC old = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    int id = GetDlgCtrlID(h);
+    if (m == WM_MOUSEMOVE) {
+        if (g_hoverBtn != id) {
+            g_hoverBtn = id;
+            InvalidateRect(h, nullptr, TRUE);
+        }
+        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
+        TrackMouseEvent(&tme);
+    } else if (m == WM_MOUSELEAVE) {
+        if (g_hoverBtn == id) {
+            g_hoverBtn = 0;
+            InvalidateRect(h, nullptr, TRUE);
+        }
+    }
+    return CallWindowProcW(old, h, m, w, l);
+}
+
+HWND Hoverable(HWND h) {
+    WNDPROC old = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(h, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(HoverProc)));
+    SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(old));
+    return h;
 }
 
 void BrowseForFolder() {
@@ -448,15 +520,47 @@ void OnInstallClicked() {
         return;
     }
 
+    // 装之前先说清楚要覆盖什么。放在这里是因为此时路径已定，
+    // 但还没禁按钮、没切页，用户选“否”能干净地退回来。
+    if (!g_uninstallMode) {
+        std::wstring oldVer, oldLoc;
+        const bool hasReg = InstalledVersion(oldVer, oldLoc);
+        const std::wstring exe = Join(g_installDir, kExeName);
+        const bool hasFiles = Exists(exe);
+
+        if (hasReg || hasFiles) {
+            std::wstring msg;
+            if (hasReg) {
+                msg = L"这台电脑上已经装了 " + std::wstring(kAppName) + L" v" +
+                      (oldVer.empty() ? L"?" : oldVer) +
+                      L"。\n\n覆盖安装会替换掉原来的程序文件，桌面和开始菜单的"
+                      L"快捷方式会指向新版本。\n\n要继续吗？";
+            } else {
+                msg = L"目标目录里已经有同名的程序文件：\n" + exe +
+                      L"\n\n继续安装会覆盖它，要继续吗？";
+            }
+            // 旧装位置和这次不一样的话，旧的不会被清掉，得说一声
+            if (!oldLoc.empty() && _wcsicmp(oldLoc.c_str(),
+                                            g_installDir.c_str()) != 0)
+                msg += L"\n\n注意：原来装在\n" + oldLoc + L"\n这次装到\n" +
+                       g_installDir + L"\n旧的那一份不会被自动删除。";
+            if (MessageBoxW(g_main, msg.c_str(), L"检测到已安装的版本",
+                            MB_YESNO | MB_ICONQUESTION) != IDYES) {
+                SetStatus("已取消安装。");
+                return;
+            }
+        }
+    }
+
     EnableWindow(g_installBtn, FALSE);
     EnableWindow(g_cancelBtn, FALSE);
     SetPage(1);
-    SendMessageW(g_progress, PBM_SETPOS, 20, 0);
+    SetProgress(20);
     UpdateWindow(g_main);
 
     std::string err;
     bool ok = g_uninstallMode ? DoUninstall(err) : DoInstall(err);
-    SendMessageW(g_progress, PBM_SETPOS, ok ? 100 : 20, 0);
+    SetProgress(ok ? 100 : 20);
 
     if (!ok) {
         MessageBoxW(g_main, W(err.c_str()).c_str(),
@@ -510,6 +614,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             RECT s = {S(68), S(40), rc.right - S(24), S(58)};
             Text(dc, g_uninstallMode ? L"卸载向导" : L"安装向导", s, kMuted, g_fSmall,
                  DT_LEFT | DT_SINGLELINE);
+            RECT v = {rc.right - S(120), S(20), rc.right - S(24), S(44)};
+            Text(dc, std::wstring(L"v") + kVersion, v, kMuted, g_fSmall,
+                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
             if (g_page == 1) {
                 RECT p = {S(24), S(120), rc.right - S(24), S(148)};
@@ -523,9 +630,12 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 Text(dc, g_installDir, b, kMuted, g_fBody,
                      DT_LEFT | DT_SINGLELINE | DT_PATH_ELLIPSIS);
             } else if (g_page == 2) {
-                RECT p = {S(24), S(100), rc.right - S(24), S(128)};
+                // 完成页整块从下方 8px 滑上来
+                double e = 1.0 - (1.0 - g_fadeT) * (1.0 - g_fadeT);
+                int dy = S(static_cast<int>(8 * (1.0 - e) + 0.5));
+                RECT p = {S(24), S(100) + dy, rc.right - S(24), S(128) + dy};
                 Text(dc, L"安装完成。", p, kInk, g_fBold, DT_LEFT | DT_SINGLELINE);
-                RECT q = {S(24), S(130), rc.right - S(24), S(170)};
+                RECT q = {S(24), S(130) + dy, rc.right - S(24), S(170) + dy};
                 Text(dc,
                      L"开始菜单和桌面上都能找到它。双击打开，"
                      L"挑好功能、装好名单，就能导出一份点名器。",
@@ -552,6 +662,66 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return reinterpret_cast<LRESULT>(g_bg);
         }
 
+        case WM_DRAWITEM: {
+            DRAWITEMSTRUCT* d = reinterpret_cast<DRAWITEMSTRUCT*>(l);
+            HDC dc = d->hDC;
+            RECT r = d->rcItem;
+            wchar_t buf[160] = L"";
+            GetWindowTextW(d->hwndItem, buf, 160);
+            bool pressed = (d->itemState & ODS_SELECTED) != 0;
+            bool hover = (g_hoverBtn == static_cast<int>(d->CtlID));
+            const int id = static_cast<int>(d->CtlID);
+
+            if (id == kInstallBtn) {
+                COLORREF fill = pressed   ? RGB(0x10, 0x18, 0xc8)
+                                : hover   ? RGB(0x2c, 0x38, 0xff)
+                                          : kAccent;
+                Fill(dc, r, fill);
+                Text(dc, buf, r, RGB(255, 255, 255), g_fBold,
+                     DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                return TRUE;
+            }
+            if (id == kCancelBtn || id == kBrowse) {
+                Fill(dc, r, pressed ? RGB(0xe6, 0xea, 0xf6)
+                                    : (hover ? RGB(0xf3, 0xf5, 0xfb) : RGB(255, 255, 255)));
+                HBRUSH b = CreateSolidBrush(hover ? kAccent : kLine);
+                FrameRect(dc, &r, b);
+                DeleteObject(b);
+                Text(dc, buf, r, hover && !pressed ? kAccent : RGB(0x4a, 0x51, 0x60),
+                     g_fBody, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                return TRUE;
+            }
+            return TRUE;
+        }
+
+        case WM_TIMER:
+            if (w == kTimerProgress) {
+                int step = (kProgressMs / 15);
+                int diff = g_progressTarget - g_progressPos;
+                if (diff == 0) {
+                    KillTimer(h, kTimerProgress);
+                } else {
+                    int move = diff / (step > 0 ? step : 1);
+                    if (move == 0) move = (diff > 0) ? 1 : -1;
+                    if ((diff > 0 && move > diff) || (diff < 0 && move < diff))
+                        move = diff;
+                    g_progressPos += move;
+                    SendMessageW(g_progress, PBM_SETPOS, g_progressPos, 0);
+                }
+            } else if (w == kTimerFade) {
+                g_fadeT += 15.0 / kFadeMs;
+                if (g_fadeT >= 1.0) {
+                    g_fadeT = 1.0;
+                    KillTimer(h, kTimerFade);
+                }
+                RECT fr;
+                GetClientRect(h, &fr);
+                fr.top = S(90);
+                fr.bottom = S(180);
+                InvalidateRect(h, &fr, FALSE);
+            }
+            return 0;
+
         case WM_COMMAND:
             switch (LOWORD(w)) {
                 case kBrowse:
@@ -561,6 +731,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     OnInstallClicked();
                     return 0;
                 case kCancelBtn:
+                    DestroyWindow(h);
+                    return 0;
+                // 自绘按钮没有 BS_DEFPUSHBUTTON，回车由对话框管理器
+                // 转成 IDOK 发过来，得自己接住
+                case IDOK:
+                    OnInstallClicked();
+                    return 0;
+                case IDCANCEL:
                     DestroyWindow(h);
                     return 0;
             }
@@ -582,8 +760,8 @@ void CreateChildren() {
     SendMessageW(g_pathEdit, WM_SETFONT, (WPARAM)g_fBody, TRUE);
     SetWindowTextW(g_pathEdit, g_installDir.c_str());
 
-    g_browse = Mk(L"BUTTON", L"浏览…", BS_PUSHBUTTON | WS_TABSTOP, 412, 104, 124, 26,
-                  kBrowse);
+    g_browse = Hoverable(Mk(L"BUTTON", L"浏览…", BS_OWNERDRAW | WS_TABSTOP, 412,
+                            104, 124, 26, kBrowse));
 
     g_deskChk = Mk(L"BUTTON", L"在桌面创建快捷方式", BS_AUTOCHECKBOX | WS_TABSTOP, 24,
                    152, 300, 22, kDesktopChk);
@@ -611,11 +789,12 @@ void CreateChildren() {
                   24, 184, 340, 22, kRunChk);
     SendMessageW(g_runChk, BM_SETCHECK, BST_CHECKED, 0);
 
-    g_installBtn = Mk(L"BUTTON", L"安装", BS_DEFPUSHBUTTON | WS_TABSTOP, 432, 268, 104,
-                      32, kInstallBtn);
+    // 自绘按钮要自己画默认按钮的强调边框，回车提交仍在 WM_COMMAND 里处理
+    g_installBtn = Hoverable(Mk(L"BUTTON", L"安装", BS_OWNERDRAW | WS_TABSTOP, 432,
+                                268, 104, 32, kInstallBtn));
     SendMessageW(g_installBtn, WM_SETFONT, (WPARAM)g_fBold, TRUE);
-    g_cancelBtn = Mk(L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP, 320, 268, 104, 32,
-                     kCancelBtn);
+    g_cancelBtn = Hoverable(Mk(L"BUTTON", L"取消", BS_OWNERDRAW | WS_TABSTOP, 320,
+                               268, 104, 32, kCancelBtn));
 }
 
 bool HasArg(const wchar_t* needle) {

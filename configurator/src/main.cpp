@@ -42,6 +42,19 @@ std::string U8(const std::wstring& w) {
     return s;
 }
 
+// 取编辑框内容并去掉首尾空白
+std::wstring EditText(HWND e) {
+    int n = GetWindowTextLengthW(e);
+    if (n <= 0) return {};
+    std::wstring s(static_cast<size_t>(n) + 1, 0);
+    GetWindowTextW(e, &s[0], n + 1);
+    s.resize(static_cast<size_t>(n));
+    size_t a = s.find_first_not_of(L" \t\r\n");
+    if (a == std::wstring::npos) return {};
+    size_t b = s.find_last_not_of(L" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
 const COLORREF kInk = RGB(0x22, 0x25, 0x2e);
 const COLORREF kMuted = RGB(0x74, 0x7a, 0x89);
 const COLORREF kLine = RGB(0xdd, 0xe1, 0xec);
@@ -55,7 +68,7 @@ const COLORREF kSoft = RGB(0xf3, 0xf5, 0xfb);
 
 HINSTANCE g_inst;
 HWND g_main, g_page[2], g_nav[2], g_export, g_list, g_className, g_rosterInfo,
-    g_rosterNote;
+    g_rosterNote, g_classList;
 HFONT g_fBody, g_fSmall, g_fTitle, g_fBold, g_fNav;
 HBRUSH g_bPage, g_bSide, g_bCard;
 int g_curPage = 0;
@@ -63,12 +76,33 @@ double g_scale = 1.0;
 std::wstring g_status = L"选好功能、填好名单，就可以导出。";
 
 std::string g_template;
-std::vector<roster::Student> g_students;
+std::vector<gen::Klass> g_classes;
+int g_curClass = 0;
+bool g_syncing = false;  // 程序性改写编辑框时，挡住随之而来的 EN_CHANGE
+
 std::vector<std::pair<std::string, bool>> g_features;
 
 HWND g_cellEdit = nullptr;
 WNDPROC g_cellOld = nullptr;
 int g_editItem = -1, g_editSub = -1;
+
+// ---------- 动效状态 ----------
+
+int g_hoverCard = -1;  // 鼠标停在第一页的哪张卡片上
+int g_hoverBtn = 0;    // 鼠标停在哪个控件上（控件 id）
+std::vector<int> g_featCard;  // 功能序号 -> 它所在的卡片序号
+double g_barY = 0;      // 侧边栏强调条的当前位置与目标位置（逻辑像素）
+double g_barFrom = 0, g_barTo = 0, g_barT = 1.0;
+DWORD g_statusTick = 0;  // 状态文字变色的起始时刻
+
+constexpr UINT_PTR kTimerBar = 1;
+constexpr UINT_PTR kTimerStatus = 2;
+constexpr UINT kBarMs = 140;      // 强调条滑动时长
+constexpr UINT kStatusMs = 900;   // 状态文字颜色回落时长
+
+// 侧边栏底色只铺中间这一段，标题区和导出区保持干净
+constexpr int kSideTop = 72, kSideBottom = 612;
+constexpr int kNavX = 12, kNavY = 88, kNavW = 166, kNavH = 42, kNavGap = 48;
 
 struct Card {
     RECT rc;
@@ -80,6 +114,9 @@ int S(int v) { return static_cast<int>(v * g_scale + 0.5); }
 
 void SetStatus(const std::string& utf8) {
     g_status = W(utf8);
+    g_statusTick = GetTickCount();
+    // 建窗口的过程中 g_main 还没赋值，这时不需要动画
+    if (g_main) SetTimer(g_main, kTimerStatus, kStatusMs / 12, nullptr);
     RECT r = {S(24), S(626), S(790), S(656)};
     InvalidateRect(g_main, &r, FALSE);
 }
@@ -156,24 +193,83 @@ int FeatureIndex(const std::string& key) {
     return -1;
 }
 
+void CommitCellEdit(bool cancel);  // 定义在下面的就地编辑一节
+
+std::vector<roster::Student>& Cur() { return g_classes[g_curClass].students; }
+
+// 新建的班级还没起名，用这个占位；导入名单时会拿文件名替换掉
+bool IsPlaceholderName(const std::string& n) {
+    return n.rfind("新班级", 0) == 0;
+}
+
+// 编辑框是班级名唯一的改名入口，这里把值写回数据并刷新列表项
+void SyncClassName() {
+    if (g_syncing || g_classes.empty()) return;
+    std::string name = U8(EditText(g_className));
+    if (name == g_classes[g_curClass].name) return;
+    g_classes[g_curClass].name = name;
+    if (g_classList && g_curClass < ListView_GetItemCount(g_classList)) {
+        std::wstring w = W(name.empty() ? std::string("(未命名)") : name);
+        ListView_SetItemText(g_classList, g_curClass, 0,
+                             const_cast<wchar_t*>(w.c_str()));
+    }
+}
+
+void RefreshClassList() {
+    if (!g_classList) return;
+    ListView_DeleteAllItems(g_classList);
+    for (size_t i = 0; i < g_classes.size(); i++) {
+        std::wstring nm = W(g_classes[i].name.empty() ? std::string("(未命名)")
+                                                      : g_classes[i].name);
+        LVITEMW it = {};
+        it.mask = LVIF_TEXT;
+        it.iItem = static_cast<int>(i);
+        it.pszText = const_cast<wchar_t*>(nm.c_str());
+        ListView_InsertItem(g_classList, &it);
+    }
+    if (!g_classes.empty() && g_curClass < static_cast<int>(g_classes.size())) {
+        ListView_SetItemState(g_classList, g_curClass, LVIS_SELECTED,
+                              LVIS_SELECTED);
+        ListView_EnsureVisible(g_classList, g_curClass, FALSE);
+    }
+}
+
 void RefreshList() {
+    if (!g_list || g_classes.empty()) return;
     ListView_DeleteAllItems(g_list);
-    for (size_t i = 0; i < g_students.size(); i++) {
-        std::wstring id = std::to_wstring(g_students[i].id);
+    const auto& v = Cur();
+    for (size_t i = 0; i < v.size(); i++) {
+        std::wstring id = std::to_wstring(v[i].id);
         LVITEMW it = {};
         it.mask = LVIF_TEXT;
         it.iItem = static_cast<int>(i);
         it.pszText = const_cast<wchar_t*>(id.c_str());
         ListView_InsertItem(g_list, &it);
-        std::wstring nm = W(g_students[i].name);
+        std::wstring nm = W(v[i].name);
         ListView_SetItemText(g_list, static_cast<int>(i), 1,
                              const_cast<wchar_t*>(nm.c_str()));
     }
-    SetWindowTextW(g_rosterInfo,
-                   W(g_students.empty()
-                         ? std::string("名单还是空的。可以从 Excel 或 CSV 导入，也可以直接点“添加”。")
-                         : "共 " + std::to_string(g_students.size()) +
-                               " 人。双击单元格可以直接改学号或姓名。").c_str());
+    SetWindowTextW(
+        g_rosterInfo,
+        W(v.empty()
+              ? std::string("这个班级还没有人。可以从 Excel 或 CSV 导入，也可以直接点“添加”。")
+              : "共 " + std::to_string(v.size()) +
+                    " 人。双击单元格可以直接改学号或姓名。").c_str());
+}
+
+// 切换班级：先把编辑框里可能改过的名字存回原班级，再载入新班级
+void SelectClass(int idx) {
+    if (g_classes.empty()) return;
+    if (idx < 0 || idx >= static_cast<int>(g_classes.size())) return;
+    SyncClassName();
+    if (g_cellEdit) CommitCellEdit(false);
+    g_curClass = idx;
+    g_syncing = true;
+    SetWindowTextW(g_className, W(g_classes[idx].name).c_str());
+    g_syncing = false;
+    RefreshList();
+    ListView_SetItemState(g_classList, idx, LVIS_SELECTED, LVIS_SELECTED);
+    ListView_EnsureVisible(g_classList, idx, FALSE);
 }
 
 void LoadSheet(const roster::Sheet& sheet, const std::wstring& from) {
@@ -183,16 +279,22 @@ void LoadSheet(const roster::Sheet& sheet, const std::wstring& from) {
                     MB_OK | MB_ICONWARNING);
         return;
     }
-    g_students = r.students;
-    int n = GetWindowTextLengthW(g_className);
-    if (n == 0) {
+    Cur() = r.students;
+    // 新班级还没起名时，拿文件名当班级名
+    if (IsPlaceholderName(g_classes[g_curClass].name)) {
         std::wstring base = from;
         size_t slash = base.find_last_of(L"\\/");
         if (slash != std::wstring::npos) base = base.substr(slash + 1);
         size_t dot = base.find_last_of(L'.');
         if (dot != std::wstring::npos) base = base.substr(0, dot);
-        if (!base.empty()) SetWindowTextW(g_className, base.c_str());
+        if (!base.empty()) {
+            g_classes[g_curClass].name = U8(base);
+            g_syncing = true;
+            SetWindowTextW(g_className, base.c_str());
+            g_syncing = false;
+        }
     }
+    RefreshClassList();
     RefreshList();
     SetStatus("名单已载入：" + r.message);
 }
@@ -237,32 +339,22 @@ bool ReadTemplate() {
     return true;
 }
 
-std::wstring EditText(HWND e) {
-    int n = GetWindowTextLengthW(e);
-    if (n <= 0) return {};
-    std::wstring s(static_cast<size_t>(n) + 1, 0);
-    GetWindowTextW(e, &s[0], n + 1);
-    s.resize(static_cast<size_t>(n));
-    size_t a = s.find_first_not_of(L" \t\r\n");
-    if (a == std::wstring::npos) return {};
-    size_t b = s.find_last_not_of(L" \t\r\n");
-    return s.substr(a, b - a + 1);
-}
-
 void Export() {
+    SyncClassName();
     gen::Config cfg;
     cfg.features = g_features;
-    cfg.students = g_students;
-    cfg.className = U8(EditText(g_className));
+    cfg.classes = g_classes;
 
     std::string html, err;
     if (!gen::Build(g_template, cfg, html, err)) {
         MessageBoxW(g_main, W(err).c_str(), L"还不能导出", MB_OK | MB_ICONINFORMATION);
-        if (cfg.className.empty()) SetFocus(g_className);
         return;
     }
 
-    std::wstring suggest = EditText(g_className) + L"_点名系统.html";
+    std::wstring suggest =
+        (g_classes.empty() ? std::wstring(L"点名器")
+                           : W(g_classes[0].name)) +
+        L"_点名系统.html";
     std::wstring filter = W("网页文件 (*.html)\0*.html\0所有文件 (*.*)\0*.*\0\0");
     wchar_t file[MAX_PATH];
     wcsncpy(file, suggest.c_str(), MAX_PATH - 1);
@@ -329,8 +421,8 @@ void CommitCellEdit(bool cancel) {
     g_cellOld = nullptr;
 
     if (cancel) return;
-    if (g_editItem < 0 || g_editItem >= static_cast<int>(g_students.size())) return;
-    roster::Student& s = g_students[g_editItem];
+    if (g_editItem < 0 || g_editItem >= static_cast<int>(Cur().size())) return;
+    roster::Student& s = Cur()[g_editItem];
     if (g_editSub == 0) {
         int id = _wtoi(v.c_str());
         if (id > 0) s.id = id;
@@ -345,7 +437,7 @@ void CommitCellEdit(bool cancel) {
 }
 
 void BeginCellEdit(int item, int sub) {
-    if (item < 0 || item >= static_cast<int>(g_students.size())) return;
+    if (item < 0 || item >= static_cast<int>(Cur().size())) return;
     if (sub < 0 || sub > 1) return;
     if (g_cellEdit) CommitCellEdit(false);
 
@@ -373,6 +465,42 @@ void BeginCellEdit(int item, int sub) {
     SetFocus(g_cellEdit);
 }
 
+// 给控件挂上悬停跟踪。原窗口过程存在 GWLP_USERDATA 里
+// （按钮用不到这个字段，借来放指针是安全的）。
+LRESULT CALLBACK HoverProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    WNDPROC old = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    int id = GetDlgCtrlID(h);
+    if (m == WM_MOUSEMOVE) {
+        if (g_hoverBtn != id) {
+            g_hoverBtn = id;
+            InvalidateRect(h, nullptr, TRUE);
+        }
+        // 功能复选框还要顺手点亮它所在的卡片
+        if (id >= 4000 && id < 4000 + static_cast<int>(g_featCard.size()) &&
+            g_featCard[id - 4000] != g_hoverCard) {
+            g_hoverCard = g_featCard[id - 4000];
+            if (g_page[0]) InvalidateRect(g_page[0], nullptr, FALSE);
+        }
+        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, h, 0};
+        TrackMouseEvent(&tme);
+    } else if (m == WM_MOUSELEAVE) {
+        if (g_hoverBtn == id) {
+            g_hoverBtn = 0;
+            InvalidateRect(h, nullptr, TRUE);
+        }
+    }
+    return CallWindowProcW(old, h, m, w, l);
+}
+
+HWND Hoverable(HWND h) {
+    if (!h) return h;
+    WNDPROC old = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrW(h, GWLP_WNDPROC,
+                          reinterpret_cast<LONG_PTR>(HoverProc)));
+    SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(old));
+    return h;
+}
+
 // ---------- 页面一 ----------
 
 void BuildPage1() {
@@ -394,6 +522,7 @@ void BuildPage1() {
         Card c;
         c.rc = {S(colX[col]), S(colY[col]), S(colX[col] + colW), S(colY[col] + h)};
         c.title = W(g.title);
+        const int cardIdx = static_cast<int>(g_cards.size());
         g_cards.push_back(c);
 
         Mk(L"STATIC", g.note, SS_LEFT, colX[col] + 16, colY[col] + h - 22, colW - 32,
@@ -402,8 +531,10 @@ void BuildPage1() {
         int y = colY[col] + 34;
         for (const auto& it : g.items) {
             int idx = FeatureIndex(it.key);
-            HWND cb = Mk(L"BUTTON", it.label, BS_AUTOCHECKBOX | WS_TABSTOP,
-                         colX[col] + 16, y, colW - 32, 18, 4000 + idx, p);
+            if (idx >= 0 && idx < static_cast<int>(g_featCard.size()))
+                g_featCard[idx] = cardIdx;
+            HWND cb = Hoverable(Mk(L"BUTTON", it.label, BS_AUTOCHECKBOX | WS_TABSTOP,
+                                   colX[col] + 16, y, colW - 32, 18, 4000 + idx, p));
             if (idx >= 0 && g_features[idx].second)
                 SendMessageW(cb, BM_SETCHECK, BST_CHECKED, 0);
             Mk(L"STATIC", it.note, SS_LEFT | SS_ENDELLIPSIS, colX[col] + 34, y + 18,
@@ -416,42 +547,75 @@ void BuildPage1() {
 
 // ---------- 页面二 ----------
 
+// 班级列表铺满一列，用 ListView 是为了和学生表格长得一致
+void MakeClassList(HWND p) {
+    g_classList = CreateWindowExW(
+        WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
+            LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER,
+        S(0), S(26), S(170), S(300), p, (HMENU)6400, g_inst, nullptr);
+    ListView_SetExtendedListViewStyle(g_classList, LVS_EX_FULLROWSELECT |
+                                                        LVS_EX_DOUBLEBUFFER);
+    ApplyFont(g_classList, g_fBody);
+    LVCOLUMNW c = {};
+    c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+    c.pszText = const_cast<wchar_t*>(L"班级");
+    c.cx = S(166);
+    ListView_InsertColumn(g_classList, 0, &c);
+}
+
 void BuildPage2() {
     HWND p = g_page[1];
-    Mk(L"STATIC", "班级名称", SS_LEFT, 0, 5, 74, 18, 6000, p);
+    const int rx = 182, rw = 576;  // 右侧一栏
+
+    // ---- 左栏：班级列表 ----
+    Mk(L"STATIC", "班级", SS_LEFT, 0, 5, 170, 18, 6420, p);
+    MakeClassList(p);
+    Hoverable(Mk(L"BUTTON", "新建", BS_OWNERDRAW | WS_TABSTOP, 0, 334, 80, 26, 6410, p));
+    Hoverable(Mk(L"BUTTON", "重命名", BS_OWNERDRAW | WS_TABSTOP, 88, 334, 82, 26, 6411, p));
+    Hoverable(Mk(L"BUTTON", "上移", BS_OWNERDRAW | WS_TABSTOP, 0, 366, 50, 26, 6413, p));
+    Hoverable(Mk(L"BUTTON", "下移", BS_OWNERDRAW | WS_TABSTOP, 58, 366, 50, 26, 6414, p));
+    Hoverable(Mk(L"BUTTON", "删除", BS_OWNERDRAW | WS_TABSTOP, 116, 366, 54, 26, 6412, p));
+    Mk(L"STATIC",
+       "列表里的第一个班级是默认班级，点名器按下直接启动时用它。",
+       SS_LEFT, 0, 400, 170, 76, 6421, p);
+
+    // ---- 右栏：所选班级的名称与学生 ----
+    Mk(L"STATIC", "班级名称", SS_LEFT, rx, 5, 74, 18, 6000, p);
     g_className = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                  S(80), S(0), S(300), S(24), p, (HMENU)6001, g_inst,
-                                  nullptr);
+                                  S(rx + 80), S(0), S(280), S(24), p, (HMENU)6001,
+                                  g_inst, nullptr);
     ApplyFont(g_className, g_fBody);
     SendMessageW(g_className, EM_SETLIMITTEXT, 60, 0);
     SendMessageW(g_className, EM_SETCUEBANNER, TRUE,
                  reinterpret_cast<LPARAM>(L"我的班级"));
 
     Mk(L"STATIC",
-       "这个名字会出现在点名器设置菜单的标题上，也会作为预设名出现在装载节点。例如：A2班、高二(3)班。",
-       SS_LEFT, 80, 28, 620, 34, 6002, p);
+       "会出现在设置菜单的标题和装载节点的预设名里。例如：A2班、高二(3)班。",
+       SS_LEFT | SS_ENDELLIPSIS, rx + 80, 30, rw - 80, 18, 6002, p);
 
     struct Btn {
         const char* text;
+        int x;
         int w;
         int id;
     } btns[] = {
-        {"从 Excel 导入", 124, 6100}, {"从 CSV 导入", 112, 6101},
-        {"添加", 66, 6102},           {"删除", 66, 6103},
-        {"上移", 66, 6104},           {"下移", 66, 6105},
-        {"重新编号", 92, 6106},       {"清空", 66, 6107},
+        {"从 Excel 导入", 0, 112, 6100},   {"从 CSV 导入", 120, 100, 6101},
+        {"添加", 228, 60, 6102},            {"删除", 296, 60, 6103},
+        {"上移", 364, 60, 6104},            {"下移", 432, 60, 6105},
+        {"重新编号", 0, 88, 6106},          {"清空", 96, 60, 6107},
     };
-    int x = 0;
     for (const auto& b : btns) {
-        Mk(L"BUTTON", b.text, BS_OWNERDRAW | WS_TABSTOP, x, 74, b.w, 26, b.id, p);
-        x += b.w + 8;
+        int y = (b.id >= 6106) ? 106 : 74;
+        Hoverable(Mk(L"BUTTON", b.text, BS_OWNERDRAW | WS_TABSTOP, rx + b.x, y, b.w,
+                     26, b.id, p));
     }
 
     g_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT |
                                  LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-                             S(0), S(112), S(758), S(330), p, (HMENU)6200, g_inst,
+                             S(rx), S(142), S(rw), S(300), p, (HMENU)6200, g_inst,
                              nullptr);
     ListView_SetExtendedListViewStyle(
         g_list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
@@ -459,18 +623,20 @@ void BuildPage2() {
     LVCOLUMNW c = {};
     c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
     c.pszText = const_cast<wchar_t*>(L"学号");
-    c.cx = S(96);
+    c.cx = S(76);
     ListView_InsertColumn(g_list, 0, &c);
     c.pszText = const_cast<wchar_t*>(L"姓名");
-    c.cx = S(636);
+    c.cx = S(492);
     ListView_InsertColumn(g_list, 1, &c);
 
-    g_rosterInfo = Mk(L"STATIC", "", SS_LEFT, 0, 450, 758, 20, 6300, p);
-    g_rosterNote = Mk(L"STATIC", "", SS_LEFT | SS_ENDELLIPSIS, 0, 474, 758, 20, 6301, p);
+    g_rosterInfo = Mk(L"STATIC", "", SS_LEFT, rx, 450, rw, 20, 6300, p);
+    g_rosterNote =
+        Mk(L"STATIC", "", SS_LEFT | SS_ENDELLIPSIS, rx, 474, rw, 20, 6301, p);
     SetWindowTextW(
         g_rosterNote,
         L"表格可以是只有姓名一列、学号加姓名两列，或是第一行写着“学号 / 姓名”的表头。");
 
+    RefreshClassList();
     RefreshList();
 }
 
@@ -480,6 +646,11 @@ void SetPage(int page) {
         ShowWindow(g_page[i], page == i ? SW_SHOW : SW_HIDE);
         InvalidateRect(g_nav[i], nullptr, TRUE);
     }
+    // 让选中条从当前位置滑到新的导航项
+    g_barFrom = g_barY;
+    g_barTo = kNavY + page * kNavGap;
+    g_barT = (g_barFrom == g_barTo) ? 1.0 : 0.0;
+    if (g_barT < 1.0 && g_main) SetTimer(g_main, kTimerBar, 15, nullptr);
 }
 
 // ---------- 主窗口 ----------
@@ -497,16 +668,49 @@ LRESULT CALLBACK PageProc(HWND hw, UINT m, WPARAM w, LPARAM l) {
             GetClientRect(hw, &rc);
             FillRect(dc, &rc, g_bPage);
             if (GetWindowLongPtrW(hw, GWLP_ID) == 900) {
-                for (const auto& c : g_cards) {
-                    FillRounded(dc, c.rc, S(8), kCard, kLine);
+                for (size_t i = 0; i < g_cards.size(); i++) {
+                    const Card& c = g_cards[i];
+                    bool hov = (static_cast<int>(i) == g_hoverCard);
+                    FillRounded(dc, c.rc, S(8), kCard, hov ? kAccent : kLine);
                     RECT t = {c.rc.left + S(16), c.rc.top + S(10),
                               c.rc.right - S(16), c.rc.top + S(30)};
-                    DrawTextC(dc, c.title, t, kInk, g_fBold,
+                    DrawTextC(dc, c.title, t, hov ? kAccent : kInk, g_fBold,
                               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
                 }
             }
             EndPaint(hw, &ps);
             return 0;
+        }
+        case WM_MOUSEMOVE: {
+            if (GetWindowLongPtrW(hw, GWLP_ID) != 900) break;
+            POINT pt = {static_cast<short>(LOWORD(l)),
+                        static_cast<short>(HIWORD(l))};
+            int hover = -1;
+            for (size_t i = 0; i < g_cards.size(); i++)
+                if (PtInRect(&g_cards[i].rc, pt)) {
+                    hover = static_cast<int>(i);
+                    break;
+                }
+            if (hover != g_hoverCard) {
+                g_hoverCard = hover;
+                InvalidateRect(hw, nullptr, FALSE);
+            }
+            TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hw, 0};
+            TrackMouseEvent(&tme);
+            break;
+        }
+        case WM_MOUSELEAVE: {
+            // 移到子控件上时也会收到 LEAVE，这时卡片高亮不该灭
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hw, &pt);
+            RECT rc;
+            GetClientRect(hw, &rc);
+            if (!PtInRect(&rc, pt) && g_hoverCard != -1) {
+                g_hoverCard = -1;
+                InvalidateRect(hw, nullptr, FALSE);
+            }
+            break;
         }
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLORBTN: {
@@ -536,10 +740,10 @@ void RegisterClasses() {
 void CreateChildren(HWND h) {
     const char* navText[2] = {"功能模块", "班级名单"};
     for (int i = 0; i < 2; i++) {
-        g_nav[i] = CreateWindowExW(0, L"BUTTON", W(navText[i]).c_str(),
-                                   WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
-                                   S(12), S(88 + i * 48), S(166), S(42), h,
-                                   (HMENU)(INT_PTR)(1001 + i), g_inst, nullptr);
+        g_nav[i] = Hoverable(CreateWindowExW(
+            0, L"BUTTON", W(navText[i]).c_str(),
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, S(kNavX), S(kNavY + i * kNavGap),
+            S(kNavW), S(kNavH), h, (HMENU)(INT_PTR)(1001 + i), g_inst, nullptr));
         ApplyFont(g_nav[i], g_fNav);
     }
 
@@ -552,9 +756,10 @@ void CreateChildren(HWND h) {
     BuildPage1();
     BuildPage2();
 
-    g_export = CreateWindowExW(0, L"BUTTON", L"导出 index.html",
-                               WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, S(784), S(620),
-                               S(172), S(36), h, (HMENU)2001, g_inst, nullptr);
+    g_export = Hoverable(CreateWindowExW(0, L"BUTTON", L"导出 index.html",
+                                         WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+                                         S(784), S(620), S(172), S(36), h,
+                                         (HMENU)2001, g_inst, nullptr));
     ApplyFont(g_export, g_fBold);
     SetPage(0);
 }
@@ -575,6 +780,68 @@ void OnCommand(HWND h, int id, int code, HWND ctl) {
         SetStatus("功能开关已更新。");
         return;
     }
+    // 班级名编辑框：随时改随时写回当前班级
+    if (id == 6001 && code == EN_CHANGE) {
+        SyncClassName();
+        return;
+    }
+
+    if (code == BN_CLICKED && id >= 6410 && id <= 6414) {
+        switch (id) {
+            case 6410: {  // 新建
+                SyncClassName();
+                g_classes.push_back({"新班级 " +
+                                         std::to_string(g_classes.size() + 1),
+                                     {}});
+                g_curClass = static_cast<int>(g_classes.size()) - 1;
+                RefreshClassList();
+                SelectClass(g_curClass);
+                SetFocus(g_className);
+                SendMessageW(g_className, EM_SETSEL, 0, -1);
+                SetStatus("给新班级起个名字，再加学生。第一个班级是默认班级。");
+                break;
+            }
+            case 6411:  // 重命名就是改右边那个框
+                SetFocus(g_className);
+                SendMessageW(g_className, EM_SETSEL, 0, -1);
+                SetStatus("在“班级名称”里改好后，列表会自动跟着变。");
+                break;
+            case 6412: {  // 删除
+                if (g_classes.size() <= 1) {
+                    MessageBoxW(h, L"至少要保留一个班级。", L"不能删除",
+                                MB_OK | MB_ICONINFORMATION);
+                    break;
+                }
+                std::wstring nm = W(g_classes[g_curClass].name);
+                std::wstring ask = L"删除班级「" + nm + L"」和它的名单？";
+                if (MessageBoxW(h, ask.c_str(), L"确认",
+                                MB_YESNO | MB_ICONQUESTION) != IDYES)
+                    break;
+                g_classes.erase(g_classes.begin() + g_curClass);
+                if (g_curClass >= static_cast<int>(g_classes.size()))
+                    g_curClass = static_cast<int>(g_classes.size()) - 1;
+                RefreshClassList();
+                SelectClass(g_curClass);
+                SetStatus("班级已删除。");
+                break;
+            }
+            case 6413:
+            case 6414: {  // 上移 / 下移，第一位就是默认班级
+                int to = g_curClass + (id == 6413 ? -1 : 1);
+                if (to >= 0 && to < static_cast<int>(g_classes.size())) {
+                    SyncClassName();
+                    std::swap(g_classes[g_curClass], g_classes[to]);
+                    g_curClass = to;
+                    RefreshClassList();
+                    SelectClass(g_curClass);
+                    SetStatus(id == 6413 ? "已上移。" : "已下移。");
+                }
+                break;
+            }
+        }
+        return;
+    }
+
     if (code != BN_CLICKED || id < 6100 || id > 6107) return;
 
     switch (id) {
@@ -587,12 +854,12 @@ void OnCommand(HWND h, int id, int code, HWND ctl) {
         case 6102: {
             roster::Student s;
             int maxId = 0;
-            for (const auto& x2 : g_students) maxId = (std::max)(maxId, x2.id);
+            for (const auto& x2 : Cur()) maxId = (std::max)(maxId, x2.id);
             s.id = maxId + 1;
             s.name = "新同学";
-            g_students.push_back(s);
+            Cur().push_back(s);
             RefreshList();
-            int row = static_cast<int>(g_students.size()) - 1;
+            int row = static_cast<int>(Cur().size()) - 1;
             ListView_EnsureVisible(g_list, row, FALSE);
             ListView_SetItemState(g_list, row, LVIS_SELECTED, LVIS_SELECTED);
             BeginCellEdit(row, 1);
@@ -601,7 +868,7 @@ void OnCommand(HWND h, int id, int code, HWND ctl) {
         case 6103: {
             int sel = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
             if (sel >= 0) {
-                g_students.erase(g_students.begin() + sel);
+                Cur().erase(Cur().begin() + sel);
                 RefreshList();
                 SetStatus("已删除一行。");
             }
@@ -611,24 +878,24 @@ void OnCommand(HWND h, int id, int code, HWND ctl) {
         case 6105: {
             int sel = ListView_GetNextItem(g_list, -1, LVNI_SELECTED);
             int to = sel + (id == 6104 ? -1 : 1);
-            if (sel >= 0 && to >= 0 && to < static_cast<int>(g_students.size())) {
-                std::swap(g_students[sel], g_students[to]);
+            if (sel >= 0 && to >= 0 && to < static_cast<int>(Cur().size())) {
+                std::swap(Cur()[sel], Cur()[to]);
                 RefreshList();
                 ListView_SetItemState(g_list, to, LVIS_SELECTED, LVIS_SELECTED);
             }
             break;
         }
         case 6106:
-            for (size_t i = 0; i < g_students.size(); i++)
-                g_students[i].id = static_cast<int>(i) + 1;
+            for (size_t i = 0; i < Cur().size(); i++)
+                Cur()[i].id = static_cast<int>(i) + 1;
             RefreshList();
             SetStatus("学号已按当前顺序重排。");
             break;
         case 6107:
-            if (!g_students.empty() &&
+            if (!Cur().empty() &&
                 MessageBoxW(h, L"清空当前名单？", L"确认",
                             MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                g_students.clear();
+                Cur().clear();
                 RefreshList();
             }
             break;
@@ -655,7 +922,8 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             GetClientRect(h, &rc);
             FillRect(dc, &rc, g_bPage);
 
-            RECT side = {0, 0, S(190), rc.bottom};
+            // 底色只铺侧边栏中间这一段，顶部标题区和底部导出区保持干净
+            RECT side = {0, S(kSideTop), S(190), S(kSideBottom)};
             FillRect(dc, &side, g_bSide);
 
             HPEN pen = CreatePen(PS_SOLID, 1, kLine);
@@ -680,9 +948,41 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             DrawTextC(dc, L"挑好功能、装好名单，导出一份双击就能用的点名器。", s2,
                       kMuted, g_fSmall, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-            RECT foot = {S(24), S(626), S(770), S(652)};
-            DrawTextC(dc, g_status, foot, kMuted, g_fBody,
+            // 选中条由这里统一画，才能在两个导航项之间平滑滑过去
+            {
+                int barH = S(kNavH);
+                RECT bar = {S(kNavX), static_cast<LONG>(g_barY * g_scale + 0.5),
+                            S(kNavX + 3),
+                            static_cast<LONG>(g_barY * g_scale + 0.5) + barH};
+                HBRUSH b = CreateSolidBrush(kAccent);
+                FillRect(dc, &bar, b);
+                DeleteObject(b);
+            }
+
+            // 状态文字刚变过时先亮一下再回落
+            COLORREF sc = kMuted;
+            if (g_statusTick) {
+                DWORD el = GetTickCount() - g_statusTick;
+                if (el < kStatusMs) {
+                    int k = static_cast<int>(255 - el * 255 / kStatusMs);
+                    auto mix = [k](int a, int b) {
+                        return a + (b - a) * k / 255;
+                    };
+                    sc = RGB(mix(GetRValue(kMuted), GetRValue(kAccent)),
+                             mix(GetGValue(kMuted), GetGValue(kAccent)),
+                             mix(GetBValue(kMuted), GetBValue(kAccent)));
+                } else {
+                    g_statusTick = 0;
+                }
+            }
+            RECT foot = {S(24), S(626), S(960), S(652)};
+            DrawTextC(dc, g_status, foot, sc, g_fBody,
                       DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+
+            // 版本号放标题条右端，下面那行留给导出按钮
+            RECT ver = {rc.right - S(130), S(20), rc.right - S(24), S(44)};
+            DrawTextC(dc, L"v0.2", ver, kMuted, g_fSmall,
+                      DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
             EndPaint(h, &ps);
             return 0;
@@ -698,25 +998,24 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
             if (d->CtlID == 1001 || d->CtlID == 1002) {
                 bool active = (d->CtlID == 1001) == (g_curPage == 0);
-                HBRUSH bg = CreateSolidBrush(active ? kPage : kSide);
+                bool hover = (g_hoverBtn == static_cast<int>(d->CtlID));
+                // 强调条改由主窗口统一画（要滑动的），这里只铺底和文字
+                HBRUSH bg =
+                    CreateSolidBrush(active ? kPage : (hover ? kSoft : kSide));
                 FillRect(dc, &r, bg);
                 DeleteObject(bg);
-                if (active) {
-                    RECT bar = {r.left, r.top, r.left + S(3), r.bottom};
-                    HBRUSH b = CreateSolidBrush(kAccent);
-                    FillRect(dc, &bar, b);
-                    DeleteObject(b);
-                }
                 RECT t = r;
                 t.left += S(18);
                 DrawTextC(dc, buf, t, active ? kAccent : kInk,
-                          active ? g_fBold : g_fNav,
+                          active || hover ? g_fBold : g_fNav,
                           DT_LEFT | DT_SINGLELINE | DT_VCENTER);
                 return TRUE;
             }
 
             if (d->CtlID == 2001) {
-                COLORREF fill = pressed ? RGB(0x10, 0x18, 0xc8) : kAccent;
+                COLORREF fill = pressed   ? RGB(0x10, 0x18, 0xc8)
+                                : (g_hoverBtn == 2001) ? RGB(0x2c, 0x38, 0xff)
+                                                       : kAccent;
                 FillRounded(dc, r, S(7), fill, fill);
                 DrawTextC(dc, buf, r, RGB(255, 255, 255), g_fBold,
                           DT_CENTER | DT_SINGLELINE | DT_VCENTER);
@@ -724,9 +1023,10 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
 
             bool primary = (d->CtlID == 6100);
-            FillRounded(dc, r, S(6), pressed ? kSoft : kPage,
-                        primary ? kAccent : kLine);
-            DrawTextC(dc, buf, r, primary ? kAccent : kInk,
+            bool hov = (g_hoverBtn == static_cast<int>(d->CtlID));
+            FillRounded(dc, r, S(6), pressed ? kSoft : (hov ? kSoft : kPage),
+                        primary || hov ? kAccent : kLine);
+            DrawTextC(dc, buf, r, primary || hov ? kAccent : kInk,
                       primary ? g_fBold : g_fBody,
                       DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             return TRUE;
@@ -741,7 +1041,20 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         case WM_NOTIFY: {
             NMHDR* nh = reinterpret_cast<NMHDR*>(l);
-            if (nh->idFrom == 6200) {
+            if (nh->idFrom == 6400) {
+                if (nh->code == LVN_ITEMCHANGED) {
+                    NMLISTVIEW* nv = reinterpret_cast<NMLISTVIEW*>(l);
+                    // 只看“选中”这一类变化；刷新列表时也会发通知，
+                    // 但那时选中的就是 g_curClass 本身，天然被挡掉
+                    if ((nv->uNewState & LVIS_SELECTED) &&
+                        !(nv->uOldState & LVIS_SELECTED) && nv->iItem >= 0 &&
+                        nv->iItem != g_curClass)
+                        SelectClass(nv->iItem);
+                } else if (nh->code == NM_DBLCLK) {
+                    SetFocus(g_className);
+                    SendMessageW(g_className, EM_SETSEL, 0, -1);
+                }
+            } else if (nh->idFrom == 6200) {
                 if (nh->code == NM_DBLCLK) {
                     NMITEMACTIVATE* a = reinterpret_cast<NMITEMACTIVATE*>(l);
                     if (a->iItem >= 0) BeginCellEdit(a->iItem, a->iSubItem);
@@ -755,6 +1068,25 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+
+        case WM_TIMER:
+            if (w == kTimerBar) {
+                g_barT += 15.0 / kBarMs;
+                if (g_barT >= 1.0) {
+                    g_barT = 1.0;
+                    KillTimer(h, kTimerBar);
+                }
+                double e = 1.0 - (1.0 - g_barT) * (1.0 - g_barT);  // 缓出
+                g_barY = g_barFrom + (g_barTo - g_barFrom) * e;
+                RECT r = {0, S(kSideTop), S(20), S(kSideBottom)};
+                InvalidateRect(h, &r, FALSE);
+            } else if (w == kTimerStatus) {
+                RECT r = {S(24), S(626), S(790), S(656)};
+                InvalidateRect(h, &r, FALSE);
+                if (GetTickCount() - g_statusTick >= kStatusMs)
+                    KillTimer(h, kTimerStatus);
+            }
+            return 0;
 
         case WM_CLOSE:
             DestroyWindow(h);
@@ -800,6 +1132,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     }
     for (const auto& g : feat::Groups())
         for (const auto& it : g.items) g_features.emplace_back(it.key, true);
+    g_featCard.assign(g_features.size(), -1);
+
+    // 起手给一个空班级，用户可以直接改名或往里导名单
+    g_classes.push_back({"我的班级", {}});
+    g_barY = kNavY;
 
     RegisterClasses();
 

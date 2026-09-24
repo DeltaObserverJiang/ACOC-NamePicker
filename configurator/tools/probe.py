@@ -31,6 +31,16 @@ setTimeout(function () {
         r.menuBtn = document.querySelectorAll('#openMenuBtn').length;
         r.tabs = document.querySelectorAll('.tab-btn').length;
         r.startup = document.querySelectorAll('#startupScreen').length;
+        // 多班级：预设数组、按钮数量，以及点下去是否真的换班
+        r.presets = (typeof CLASS_PRESETS !== 'undefined') ? CLASS_PRESETS.length : 0;
+        r.presetBtns = document.querySelectorAll('[id^=loadPresetBtn]').length;
+        if (r.presets > 1) {
+            q('loadPresetBtn1').click();
+            r.afterClick = classNameStr;
+            r.afterClickItems =
+                document.querySelectorAll('#nameList .student-item').length;
+        }
+        initSystemData(CLASS_NAMES, CLASS_NAME);
         r.expBtn = document.querySelectorAll('#unlockExpBtn').length;
         r.glitch = document.querySelectorAll('#glitchProbInput').length;
         r.dataBtn = document.querySelectorAll('#exportConfigBtn').length;

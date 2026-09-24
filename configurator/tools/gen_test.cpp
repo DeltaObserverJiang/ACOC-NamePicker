@@ -65,8 +65,8 @@ int main(int argc, char** argv) {
                 for (const char* o : off)
                     if (kv.first == o) kv.second = false;
         }
-        cfg.students = Sample();
-        cfg.className = "高三 (7) 班";
+        cfg.classes.push_back({"高三 (7) 班", Sample()});
+        cfg.classes.push_back({"高三 (8) 班", Sample()});
 
         std::string out, err;
         if (!gen::Build(tpl, cfg, out, err)) {
@@ -83,6 +83,40 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        // 多班级：预设数组只在声明处出现一次
+        auto count = [&out](const char* needle) {
+            int n = 0;
+            for (size_t p = out.find(needle); p != std::string::npos;
+                 p = out.find(needle, p + 1))
+                n++;
+            return n;
+        };
+        if (count("const CLASS_PRESETS = [") != 1) {
+            std::printf("FAIL: %s 缺少 CLASS_PRESETS 声明\n", cs.name);
+            return 1;
+        }
+        // 关掉名单装载节点时，整个装载界面连带预设按钮一起被裁掉
+        const bool rosterOn = std::string(cs.name) != "none";
+        if (count("CLASS_PRESETS.forEach") != (rosterOn ? 1 : 0)) {
+            std::printf("FAIL: %s 预设按钮的绑定循环数目不对\n", cs.name);
+            return 1;
+        }
+        int btns = 0;
+        for (size_t p = out.find("id=\"loadPresetBtn"); p != std::string::npos;
+             p = out.find("id=\"loadPresetBtn", p + 1))
+            btns++;
+        const int want = rosterOn ? 2 : 0;
+        if (btns != want) {
+            std::printf("FAIL: %s 预设按钮 %d 个，应为 %d\n", cs.name, btns, want);
+            return 1;
+        }
+        for (const char* nm : {"高三 (7) 班", "高三 (8) 班"}) {
+            if (out.find(nm) == std::string::npos) {
+                std::printf("FAIL: %s 缺少班级名 %s\n", cs.name, nm);
+                return 1;
+            }
+        }
+
         const std::string path = dir + "/_" + cs.name + ".html";
         if (!WriteAll(path.c_str(), out)) return Fail("写出失败");
         std::printf("%-5s %8u chars  %s\n", cs.name, (unsigned)out.size(),
