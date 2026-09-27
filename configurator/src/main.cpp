@@ -73,7 +73,7 @@ HFONT g_fBody, g_fSmall, g_fTitle, g_fBold, g_fNav;
 HBRUSH g_bPage, g_bSide, g_bCard;
 int g_curPage = 0;
 double g_scale = 1.0;
-std::wstring g_status = L"选好功能、填好名单，就可以导出。";
+std::wstring g_status = L"选好功能、备妥名单，即可导出。";
 
 std::string g_template;
 std::vector<gen::Klass> g_classes;
@@ -197,12 +197,12 @@ void CommitCellEdit(bool cancel);  // 定义在下面的就地编辑一节
 
 std::vector<roster::Student>& Cur() { return g_classes[g_curClass].students; }
 
-// 新建的班级还没起名，用这个占位；导入名单时会拿文件名替换掉
+// 新建班级的占位名，导入名单时会以文件名替换
 bool IsPlaceholderName(const std::string& n) {
     return n.rfind("新班级", 0) == 0;
 }
 
-// 编辑框是班级名唯一的改名入口，这里把值写回数据并刷新列表项
+// 班级名以编辑框为准，这里把改动写回数据并同步列表项
 void SyncClassName() {
     if (g_syncing || g_classes.empty()) return;
     std::string name = U8(EditText(g_className));
@@ -252,9 +252,9 @@ void RefreshList() {
     SetWindowTextW(
         g_rosterInfo,
         W(v.empty()
-              ? std::string("这个班级还没有人。可以从 Excel 或 CSV 导入，也可以直接点“添加”。")
+              ? std::string("本班名单尚空。可从 Excel 或 CSV 导入，也可直接点“添加”逐条录入。")
               : "共 " + std::to_string(v.size()) +
-                    " 人。双击单元格可以直接改学号或姓名。").c_str());
+                    " 人。双击单元格可直接修改学号或姓名。").c_str());
 }
 
 // 切换班级：先把编辑框里可能改过的名字存回原班级，再载入新班级
@@ -475,7 +475,7 @@ LRESULT CALLBACK HoverProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_hoverBtn = id;
             InvalidateRect(h, nullptr, TRUE);
         }
-        // 功能复选框还要顺手点亮它所在的卡片
+        // 光标停在功能复选框上时，同时点亮它所属的卡片
         if (id >= 4000 && id < 4000 + static_cast<int>(g_featCard.size()) &&
             g_featCard[id - 4000] != g_hoverCard) {
             g_hoverCard = g_featCard[id - 4000];
@@ -577,7 +577,7 @@ void BuildPage2() {
     Hoverable(Mk(L"BUTTON", "下移", BS_OWNERDRAW | WS_TABSTOP, 58, 366, 50, 26, 6414, p));
     Hoverable(Mk(L"BUTTON", "删除", BS_OWNERDRAW | WS_TABSTOP, 116, 366, 54, 26, 6412, p));
     Mk(L"STATIC",
-       "列表里的第一个班级是默认班级，点名器按下直接启动时用它。",
+       "列表首位的班级为默认班级；点名器直接启动时即使用它。",
        SS_LEFT, 0, 400, 170, 76, 6421, p);
 
     // ---- 右栏：所选班级的名称与学生 ----
@@ -592,7 +592,7 @@ void BuildPage2() {
                  reinterpret_cast<LPARAM>(L"我的班级"));
 
     Mk(L"STATIC",
-       "会出现在设置菜单的标题和装载节点的预设名里。例如：A2班、高二(3)班。",
+       "该名称会出现在设置菜单标题与装载节点的预设项中，例如 A2班、高二(3)班。",
        SS_LEFT | SS_ENDELLIPSIS, rx + 80, 30, rw - 80, 18, 6002, p);
 
     struct Btn {
@@ -634,7 +634,7 @@ void BuildPage2() {
         Mk(L"STATIC", "", SS_LEFT | SS_ENDELLIPSIS, rx, 474, rw, 20, 6301, p);
     SetWindowTextW(
         g_rosterNote,
-        L"表格可以是只有姓名一列、学号加姓名两列，或是第一行写着“学号 / 姓名”的表头。");
+        L"表格形态不限：仅姓名一列、学号与姓名两列，或首行为“学号 / 姓名”表头均可。");
 
     RefreshClassList();
     RefreshList();
@@ -798,22 +798,22 @@ void OnCommand(HWND h, int id, int code, HWND ctl) {
                 SelectClass(g_curClass);
                 SetFocus(g_className);
                 SendMessageW(g_className, EM_SETSEL, 0, -1);
-                SetStatus("给新班级起个名字，再加学生。第一个班级是默认班级。");
+                SetStatus("请先为班级命名，再录入学生。列表首位的班级为默认班级。");
                 break;
             }
             case 6411:  // 重命名就是改右边那个框
                 SetFocus(g_className);
                 SendMessageW(g_className, EM_SETSEL, 0, -1);
-                SetStatus("在“班级名称”里改好后，列表会自动跟着变。");
+                SetStatus("在“班级名称”中修改即可，列表会同步更新。");
                 break;
             case 6412: {  // 删除
                 if (g_classes.size() <= 1) {
-                    MessageBoxW(h, L"至少要保留一个班级。", L"不能删除",
+                    MessageBoxW(h, L"至少需保留一个班级。", L"不能删除",
                                 MB_OK | MB_ICONINFORMATION);
                     break;
                 }
                 std::wstring nm = W(g_classes[g_curClass].name);
-                std::wstring ask = L"删除班级「" + nm + L"」和它的名单？";
+                std::wstring ask = L"删除班级「" + nm + L"」及其名单？";
                 if (MessageBoxW(h, ask.c_str(), L"确认",
                                 MB_YESNO | MB_ICONQUESTION) != IDYES)
                     break;
@@ -959,7 +959,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 DeleteObject(b);
             }
 
-            // 状态文字刚变过时先亮一下再回落
+            // 状态文字刚更新时以强调色显示，随后回落到常规色
             COLORREF sc = kMuted;
             if (g_statusTick) {
                 DWORD el = GetTickCount() - g_statusTick;
@@ -981,7 +981,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
             // 版本号放标题条右端，下面那行留给导出按钮
             RECT ver = {rc.right - S(130), S(20), rc.right - S(24), S(44)};
-            DrawTextC(dc, L"v0.2.1", ver, kMuted, g_fSmall,
+            DrawTextC(dc, L"v0.3", ver, kMuted, g_fSmall,
                       DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
             EndPaint(h, &ps);

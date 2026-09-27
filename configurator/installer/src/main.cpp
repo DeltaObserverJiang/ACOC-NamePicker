@@ -16,7 +16,7 @@ namespace {
 constexpr int kResApp = 3;
 
 const wchar_t* kAppName = L"A.C.O.C. 点名系统配置器";
-const wchar_t* kVersion = L"0.2.1";
+const wchar_t* kVersion = L"0.3";
 const wchar_t* kPublisher = L"A.C.O.C.";
 const wchar_t* kExeName = L"ACOCConfigurator.exe";
 const wchar_t* kUninstName = L"uninstall.exe";
@@ -73,6 +73,8 @@ double g_slideT = 1.0;
 
 // 确认覆盖页要显示的文案，由 OnInstallClicked 填好
 std::wstring g_confirmHead, g_confirmBody;
+// 点名器正在运行，覆盖前需要先把它请出去
+bool g_confirmRunning = false;
 
 constexpr UINT_PTR kTimerProgress = 1;
 constexpr UINT_PTR kTimerFade = 2;
@@ -142,27 +144,27 @@ void SetStatus(const char* utf8) { SetWindowTextW(g_status, W(utf8).c_str()); }
 bool WritePayload(const std::wstring& dest, std::string& err) {
     HRSRC hr = FindResourceW(g_inst, MAKEINTRESOURCEW(kResApp), RT_RCDATA);
     if (!hr) {
-        err = "安装包里没有找到程序数据，文件可能已损坏。";
+        err = "安装包中未找到程序数据，文件可能已损坏。";
         return false;
     }
     DWORD size = SizeofResource(g_inst, hr);
     HGLOBAL hg = LoadResource(g_inst, hr);
     const void* data = hg ? LockResource(hg) : nullptr;
     if (!data || !size) {
-        err = "安装包里的程序数据读不出来。";
+        err = "安装包中的程序数据无法读取。";
         return false;
     }
     HANDLE f = CreateFileW(dest.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) {
-        err = "写不进目标目录。如果点名器正开着，请先关掉再装。";
+        err = "无法写入目标目录。若点名器正在运行，请先关闭后再试。";
         return false;
     }
     DWORD wrote = 0;
     BOOL ok = WriteFile(f, data, size, &wrote, nullptr);
     CloseHandle(f);
     if (!ok || wrote != size) {
-        err = "写入过程中出错了。";
+        err = "写入过程中出现错误。";
         return false;
     }
     return true;
@@ -287,12 +289,75 @@ bool InstalledVersion(std::wstring& ver, std::wstring& loc) {
     return true;
 }
 
+// ---------- 正在运行的实例 ----------
+
+/* 点名器主窗口的类名，与配置器一侧的 RegisterClassExW 对应 */
+const wchar_t* kAppClass = L"AcocConfigurator";
+
+struct FindCtx {
+    HWND found;
+    DWORD self;
+};
+
+BOOL CALLBACK FindAppProc(HWND h, LPARAM p) {
+    FindCtx* c = reinterpret_cast<FindCtx*>(p);
+    if (!IsWindowVisible(h)) return TRUE;
+    wchar_t cls[64] = L"";
+    GetClassNameW(h, cls, 64);
+    if (wcscmp(cls, kAppClass) != 0) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == c->self) return TRUE;   // 排除本进程
+    c->found = h;
+    return FALSE;
+}
+
+HWND FindRunningApp() {
+    FindCtx c = {nullptr, GetCurrentProcessId()};
+    EnumWindows(FindAppProc, reinterpret_cast<LPARAM>(&c));
+    return c.found;
+}
+
+/* 短暂等待，其间照常派发消息，避免本窗口失去响应 */
+void PumpFor(int ms) {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) return;
+        if (!IsDialogMessageW(g_main, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    Sleep(ms);
+}
+
+/* 请对方自行退出，而非直接终止进程——它可能正停在导出的保存对话框上。
+   窗口消失并不意味着文件已释放，需再等它交出句柄，之后才动笔写入。 */
+void CloseRunningApp() {
+    HWND h = FindRunningApp();
+    if (h) {
+        PostMessageW(h, WM_CLOSE, 0, 0);
+        for (int i = 0; i < 60 && FindRunningApp(); i++) PumpFor(20);
+    }
+    const std::wstring exe = Join(g_installDir, kExeName);
+    for (int i = 0; i < 60; i++) {
+        HANDLE f = CreateFileW(exe.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                               nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            CloseHandle(f);
+            return;
+        }
+        PumpFor(40);
+    }
+}
+
 // ---------- 安装 / 卸载 ----------
 
 bool DoInstall(std::string& err) {
     SetStatus("正在创建目录…");
     if (!MakeDirTree(g_installDir)) {
-        err = "创建安装目录失败，换一个位置试试。";
+        err = "无法创建安装目录，请更换位置后重试。";
         return false;
     }
 
@@ -396,7 +461,7 @@ bool DoUninstall(std::string& err) {
     GetModuleFileNameW(nullptr, self, MAX_PATH);
     const std::wstring& dir = g_installDir;
     if (dir.empty()) {
-        err = "找不到安装目录。";
+        err = "未能确定安装目录。";
         return false;
     }
 
@@ -451,8 +516,8 @@ void SetProgress(int pos) {
     if (g_main) SetTimer(g_main, kTimerProgress, 15, nullptr);
 }
 
-// 让当前可见的子控件从右边 kSlideDx 处滑回原位。
-// 两个按钮不动——它们每页都在，跟着滑反而像界面整体在抖。
+// 让当前可见的子控件自右侧 kSlideDx 处滑回原位。
+// 两个按钮各页都在，不参与位移，否则整块界面都在晃。
 void BeginSlide() {
     g_slide.clear();
     if (!g_main) return;
@@ -502,10 +567,12 @@ void SetPage(int page) {
     show(kStatus, page == kPageBusy);
     show(kRunChk, page == kPageDone);
 
-    SetWindowTextW(g_installBtn, page == kPageDone   ? L"完成"
-                                : page == kPageConfirm ? L"覆盖安装"
-                                : g_uninstallMode      ? L"卸载"
-                                                       : L"安装");
+    SetWindowTextW(g_installBtn,
+                   page == kPageDone      ? L"完成"
+                   : page == kPageConfirm ? (g_confirmRunning ? L"结束并安装"
+                                                              : L"覆盖安装")
+                   : g_uninstallMode      ? L"卸载"
+                                          : L"安装");
     SetWindowTextW(g_cancelBtn, page == kPageConfirm ? L"返回" : L"取消");
     InvalidateRect(g_main, nullptr, FALSE);
     BeginSlide();
@@ -553,13 +620,13 @@ void BrowseForFolder() {
     CoTaskMemFree(idl);
 }
 
-// 安装动作本身几十毫秒就完了，进度条一闪而过，看着像什么都没干。
-// 这里把消息泵着，边等边推进度，保证整个过程至少 kMinInstallMs。
+// 安装动作本身仅需数十毫秒，进度条一闪而过，观感上如同未曾执行。
+// 这里一边派发消息一边按时间推进度，使整个过程不短于 kMinInstallMs。
 void RunInstallWithFloor(bool& ok, std::string& err) {
     const ULONGLONG t0 = GetTickCount64();
     ok = g_uninstallMode ? DoUninstall(err) : DoInstall(err);
 
-    // 这段完全由时间驱动，缓动计时器会跟这里抢进度条，先停掉
+    // 这一段完全由时间驱动，需先停掉缓动计时器，以免两者争抢进度条
     KillTimer(g_main, kTimerProgress);
     MSG msg;
     for (;;) {
@@ -585,6 +652,12 @@ void RunInstallWithFloor(bool& ok, std::string& err) {
 }
 
 void StartInstall() {
+    // 确认页已作说明，这里先把运行中的实例请出后再继续
+    if (g_confirmRunning) {
+        SetStatus("正在关闭点名器…");
+        CloseRunningApp();
+        g_confirmRunning = false;
+    }
     EnableWindow(g_installBtn, FALSE);
     EnableWindow(g_cancelBtn, FALSE);
     SetPage(kPageBusy);
@@ -658,32 +731,40 @@ void OnInstallClicked() {
         return;
     }
 
-    // 检测到旧版本时不再弹窗打断，改成切到确认页，把话说完再让用户决定
+    /* 存在旧版本需要覆盖，或点名器正在运行时，先切到确认页说明清楚。
+       实例占用会导致写入失败，与其留到最后报错，不如在此处交代。 */
     if (!g_uninstallMode) {
         std::wstring oldVer, oldLoc;
         const bool hasReg = InstalledVersion(oldVer, oldLoc);
         const std::wstring exe = Join(g_installDir, kExeName);
         const bool hasFiles = Exists(exe);
+        g_confirmRunning = FindRunningApp() != nullptr;
 
-        if (hasReg || hasFiles) {
+        if (hasReg || hasFiles || g_confirmRunning) {
             if (hasReg) {
                 g_confirmHead = L"检测到已安装的版本";
                 g_confirmBody =
-                    L"这台电脑上已经装了 " + std::wstring(kAppName) + L" v" +
+                    L"本机已安装 " + std::wstring(kAppName) + L" v" +
                     (oldVer.empty() ? L"?" : oldVer) +
                     L"。\n\n"
-                    L"覆盖安装会替换掉原来的程序文件，桌面和开始菜单的快捷方式会"
+                    L"覆盖安装将替换原有程序文件，桌面与开始菜单的快捷方式会"
                     L"指向新版本。";
-            } else {
+            } else if (hasFiles) {
                 g_confirmHead = L"目标位置已有同名文件";
-                g_confirmBody = L"这个目录里已经有一个同名的程序文件：\n" + exe +
-                                L"\n\n继续安装会覆盖它。";
+                g_confirmBody = L"该目录下已存在同名程序文件：\n" + exe +
+                                L"\n\n继续安装将覆盖它。";
+            } else {
+                g_confirmHead = L"点名器正在运行";
+                g_confirmBody =
+                    L"替换程序文件前需要先关闭点名器。\n\n"
+                    L"点击下方按钮将先请其退出，随后继续安装。";
             }
-            // 旧装位置和这次不一样的话，旧的不会被清掉，得说一声
-            if (!oldLoc.empty() &&
+            // 原有安装位置与本次不一致时，旧的一份不会被清除，需一并说明
+            if (hasReg && !oldLoc.empty() &&
                 _wcsicmp(oldLoc.c_str(), g_installDir.c_str()) != 0)
-                g_confirmBody += L"\n\n注意：原来装在\n" + oldLoc + L"\n这次装到\n" +
-                                 g_installDir + L"\n旧的那一份不会被自动删除。";
+                g_confirmBody += L"\n\n请注意：原有安装位于\n" + oldLoc +
+                                 L"\n本次将安装到\n" + g_installDir +
+                                 L"\n旧的一份不会被自动删除。";
             SetPage(kPageConfirm);
             return;
         }
@@ -745,8 +826,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 RECT hd = {S(kPadX), S(108) + dy, rc.right - S(kPadX), S(132) + dy};
                 Text(dc, g_confirmHead, hd, kInk, g_fBold,
                      DT_LEFT | DT_SINGLELINE);
-                RECT bd = {S(kPadX), S(142) + dy, rc.right - S(kPadX), S(272) + dy};
+                RECT bd = {S(kPadX), S(140) + dy, rc.right - S(kPadX), S(240) + dy};
                 Text(dc, g_confirmBody, bd, kMuted, g_fBody, DT_LEFT | DT_WORDBREAK);
+                if (g_confirmRunning) {
+                    RECT wn = {S(kPadX), S(248) + dy, rc.right - S(kPadX),
+                               S(272) + dy};
+                    Text(dc, L"点名器正在运行，继续安装将无法写入程序文件。",
+                         wn, kAccent, g_fBold, DT_LEFT | DT_SINGLELINE);
+                }
             } else if (g_page == kPageDone) {
                 // 完成页整块从下方 8px 滑上来
                 double e = 1.0 - (1.0 - g_fadeT) * (1.0 - g_fadeT);
@@ -755,8 +842,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 Text(dc, L"安装完成。", p, kInk, g_fBold, DT_LEFT | DT_SINGLELINE);
                 RECT q = {S(kPadX), S(140) + dy, rc.right - S(kPadX), S(190) + dy};
                 Text(dc,
-                     L"开始菜单和桌面上都能找到它。双击打开，"
-                     L"挑好功能、装好名单，就能导出一份点名器。",
+                     L"开始菜单与桌面均可找到。双击打开，"
+                     L"选好功能、备妥名单，即可导出一份点名器。",
                      q, kMuted, g_fBody, DT_LEFT | DT_WORDBREAK);
             }
 
@@ -911,8 +998,8 @@ void CreateChildren() {
 
     g_info = Mk(L"STATIC",
                 g_uninstallMode
-                    ? L"程序文件、以及安装时创建的快捷方式都会被删掉。"
-                    : L"装到当前用户目录，不需要管理员权限，也不会动系统里的其它东西。",
+                    ? L"程序文件与安装时创建的快捷方式都将被删除。"
+                    : L"安装到当前用户目录，无需管理员权限，也不改动系统中的其他内容。",
                 SS_LEFT, kPadX, 238, R - kPadX, 20, kInfoText);
 
     g_progress = CreateWindowExW(0, PROGRESS_CLASSW, L"",

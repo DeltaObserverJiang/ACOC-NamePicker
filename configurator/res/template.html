@@ -4,9 +4,330 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>A.C.O.C. 随机点名系统</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script>
+/* 精简的 xlsx 读取器。
+   点名器只需要「把第一张工作表的单元格原样取出来」这一件事，而 xlsx 不过是
+   ZIP 里装着 DEFLATE 压缩的 XML，所以这里自带 inflate 和最小化的 XML 扫描，
+   不引任何外部库。断网的教室里也能导入名单。
+
+   对外只暴露 XLSX.read / XLSX.utils.sheet_to_json 两个入口，
+   参数形态与原库一致，调用处不必改动。 */
+(function () {
+    'use strict';
+
+    /* ---------- DEFLATE ---------- */
+
+    function Huff(lengths) {
+        var max = 0, i;
+        for (i = 0; i < lengths.length; i++) if (lengths[i] > max) max = lengths[i];
+        var counts = new Array(max + 1);
+        for (i = 0; i <= max; i++) counts[i] = 0;
+        for (i = 0; i < lengths.length; i++) if (lengths[i]) counts[lengths[i]]++;
+        var offs = new Array(max + 2);
+        offs[0] = offs[1] = 0;
+        for (i = 1; i <= max; i++) offs[i + 1] = offs[i] + counts[i];
+        var symbols = new Array(lengths.length);
+        for (i = 0; i < lengths.length; i++)
+            if (lengths[i]) symbols[offs[lengths[i]]++] = i;
+        return { counts: counts, symbols: symbols };
+    }
+
+    function Inflater(src) {
+        this.src = src;
+        this.pos = 0;
+    }
+    Inflater.prototype.bit = function () {
+        var b = (this.src[this.pos >> 3] >> (this.pos & 7)) & 1;
+        this.pos++;
+        return b;
+    };
+    Inflater.prototype.bits = function (n) {
+        var v = 0, i;
+        for (i = 0; i < n; i++) v |= this.bit() << i;
+        return v;
+    };
+    /* 按 canonical Huffman 逐位比对，命中即返回对应的符号 */
+    Inflater.prototype.sym = function (h) {
+        var code = 0, first = 0, index = 0, len, count;
+        for (len = 1; len < h.counts.length; len++) {
+            code |= this.bit();
+            count = h.counts[len];
+            if (code - first < count) return h.symbols[index + (code - first)];
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        throw new Error('deflate: bad huffman code');
+    };
+
+    var LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43,
+                    51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+    var LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4,
+                     4, 4, 4, 5, 5, 5, 5, 0];
+    var DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257,
+                     385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289,
+                     16385, 24577];
+    var DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9,
+                      9, 10, 10, 11, 11, 12, 12, 13, 13];
+    var CLEN_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+    function fixedTables() {
+        var ll = new Array(288), dl = new Array(30), i;
+        for (i = 0; i < 144; i++) ll[i] = 8;
+        for (i = 144; i < 256; i++) ll[i] = 9;
+        for (i = 256; i < 280; i++) ll[i] = 7;
+        for (i = 280; i < 288; i++) ll[i] = 8;
+        for (i = 0; i < 30; i++) dl[i] = 5;
+        return { lit: Huff(ll), dist: Huff(dl) };
+    }
+    var FIXED = null;
+
+    function dynamicTables(inf) {
+        var hlit = inf.bits(5) + 257, hdist = inf.bits(5) + 1,
+            hclen = inf.bits(4) + 4, i;
+        var clen = new Array(19);
+        for (i = 0; i < 19; i++) clen[i] = 0;
+        for (i = 0; i < hclen; i++) clen[CLEN_ORDER[i]] = inf.bits(3);
+        var ch = Huff(clen);
+        var lens = [];
+        while (lens.length < hlit + hdist) {
+            var s = inf.sym(ch);
+            if (s < 16) {
+                lens.push(s);
+            } else if (s === 16) {
+                var prev = lens[lens.length - 1], n = 3 + inf.bits(2);
+                while (n--) lens.push(prev);
+            } else if (s === 17) {
+                var n2 = 3 + inf.bits(3);
+                while (n2--) lens.push(0);
+            } else {
+                var n3 = 11 + inf.bits(7);
+                while (n3--) lens.push(0);
+            }
+        }
+        return {
+            lit: Huff(lens.slice(0, hlit)),
+            dist: Huff(lens.slice(hlit, hlit + hdist))
+        };
+    }
+
+    function inflate(src) {
+        var inf = new Inflater(src), out = [], final = 0;
+        while (!final) {
+            final = inf.bits(1);
+            var type = inf.bits(2);
+            if (type === 0) {
+                /* 未压缩块：跳到字节边界，读长度后直接搬运 */
+                inf.pos = (inf.pos + 7) & ~7;
+                var p = inf.pos >> 3;
+                var len = src[p] | (src[p + 1] << 8);
+                p += 4;
+                for (var i = 0; i < len; i++) out.push(src[p + i]);
+                inf.pos = (p + len) << 3;
+            } else {
+                if (!FIXED) FIXED = fixedTables();
+                var t = (type === 1) ? FIXED : dynamicTables(inf);
+                for (;;) {
+                    var sym = inf.sym(t.lit);
+                    if (sym < 256) {
+                        out.push(sym);
+                    } else if (sym === 256) {
+                        break;
+                    } else {
+                        sym -= 257;
+                        var l = LEN_BASE[sym] + inf.bits(LEN_EXTRA[sym]);
+                        var ds = inf.sym(t.dist);
+                        var d = DIST_BASE[ds] + inf.bits(DIST_EXTRA[ds]);
+                        var start = out.length - d;
+                        for (var k = 0; k < l; k++) out.push(out[start + k]);
+                    }
+                }
+            }
+        }
+        return new Uint8Array(out);
+    }
+
+    /* ---------- ZIP ---------- */
+
+    function u16(b, p) { return b[p] | (b[p + 1] << 8); }
+    function u32(b, p) {
+        return (b[p] | (b[p + 1] << 8) | (b[p + 2] << 16) | (b[p + 3] << 24)) >>> 0;
+    }
+
+    function unzip(buf) {
+        /* 从尾部往前找中央目录结束标记 */
+        var eocd = -1;
+        for (var i = buf.length - 22; i >= 0 && i > buf.length - 66000; i--) {
+            if (u32(buf, i) === 0x06054b50) { eocd = i; break; }
+        }
+        if (eocd < 0) throw new Error('zip: 找不到中央目录');
+        var n = u16(buf, eocd + 10), off = u32(buf, eocd + 16), files = {};
+        for (var k = 0; k < n; k++) {
+            if (u32(buf, off) !== 0x02014b50) break;
+            var method = u16(buf, off + 10);
+            var csize = u32(buf, off + 20);
+            var nameLen = u16(buf, off + 28);
+            var extraLen = u16(buf, off + 30);
+            var cmtLen = u16(buf, off + 32);
+            var local = u32(buf, off + 42);
+            var name = '';
+            for (var j = 0; j < nameLen; j++)
+                name += String.fromCharCode(buf[off + 46 + j]);
+            /* 本地头里的 extra 长度可能和中央目录不同，以本地头为准 */
+            var lnameLen = u16(buf, local + 26), lextraLen = u16(buf, local + 28);
+            var dataAt = local + 30 + lnameLen + lextraLen;
+            files[name] = { method: method, at: dataAt, size: csize };
+            off += 46 + nameLen + extraLen + cmtLen;
+        }
+        return {
+            names: Object.keys(files),
+            bytes: function (name) {
+                var f = files[name];
+                if (!f) return null;
+                var raw = buf.subarray(f.at, f.at + f.size);
+                return f.method === 0 ? raw : inflate(raw);
+            }
+        };
+    }
+
+    /* ---------- XML ---------- */
+
+    function decode(s) {
+        if (s.indexOf('&') < 0) return s;
+        return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+                .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+                .replace(/&#(\d+);/g, function (_, d) {
+                    return String.fromCharCode(parseInt(d, 10));
+                })
+                .replace(/&amp;/g, '&');
+    }
+
+    function bytesToText(b) {
+        /* 工作表都是 UTF-8，手工解一遍，省掉 TextDecoder 的兼容顾虑 */
+        var out = '', i = 0, n = b.length;
+        while (i < n) {
+            var c = b[i++];
+            if (c < 0x80) {
+                out += String.fromCharCode(c);
+            } else if (c < 0xE0) {
+                out += String.fromCharCode(((c & 0x1F) << 6) | (b[i++] & 0x3F));
+            } else if (c < 0xF0) {
+                out += String.fromCharCode(((c & 0x0F) << 12) |
+                                           ((b[i++] & 0x3F) << 6) |
+                                           (b[i++] & 0x3F));
+            } else {
+                var cp = ((c & 0x07) << 18) | ((b[i++] & 0x3F) << 12) |
+                         ((b[i++] & 0x3F) << 6) | (b[i++] & 0x3F);
+                cp -= 0x10000;
+                out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+            }
+        }
+        return out;
+    }
+
+    /* <si> 里的 <t> 全部拼起来就是一条共享字符串 */
+    function parseSharedStrings(xml) {
+        var list = [], re = /<si>([\s\S]*?)<\/si>|<si\/>/g, m;
+        while ((m = re.exec(xml))) {
+            if (!m[1]) { list.push(''); continue; }
+            var s = '', t = /<t[^>]*>([\s\S]*?)<\/t>/g, mm;
+            while ((mm = t.exec(m[1]))) s += decode(mm[1]);
+            list.push(s);
+        }
+        return list;
+    }
+
+    function colIndex(ref) {
+        var v = 0;
+        for (var i = 0; i < ref.length; i++) {
+            var c = ref.charCodeAt(i);
+            if (c < 65 || c > 90) break;
+            v = v * 26 + (c - 64);
+        }
+        return v - 1;
+    }
+
+    function parseSheet(xml, shared) {
+        var rows = [], rre = /<row([^>]*)>([\s\S]*?)<\/row>|<row([^>]*)\/>/g, rm;
+        while ((rm = rre.exec(xml))) {
+            var attrs = rm[1] || rm[3] || '';
+            var body = rm[2] || '';
+            var rn = /r="(\d+)"/.exec(attrs);
+            var rowIdx = rn ? parseInt(rn[1], 10) - 1 : rows.length;
+            var row = [], auto = 0;
+            var cre = /<c([^>]*)\/>|<c([^>]*)>([\s\S]*?)<\/c>/g, cm;
+            while ((cm = cre.exec(body))) {
+                var ca = cm[1] || cm[2] || '';
+                var inner = cm[3] || '';
+                var ref = /r="([A-Z]+)\d+"/.exec(ca);
+                var ci = ref ? colIndex(ref[1]) : auto;
+                auto = ci + 1;
+                var tv = /t="([^"]+)"/.exec(ca);
+                var type = tv ? tv[1] : 'n';
+                var val = '';
+                if (type === 'inlineStr') {
+                    var it = /<t[^>]*>([\s\S]*?)<\/t>/.exec(inner);
+                    val = it ? decode(it[1]) : '';
+                } else {
+                    var vt = /<v>([\s\S]*?)<\/v>/.exec(inner);
+                    var raw = vt ? vt[1] : '';
+                    if (type === 's') {
+                        val = shared[parseInt(raw, 10)] || '';
+                    } else if (raw !== '') {
+                        val = decode(raw);
+                        var num = Number(val);
+                        if (!isNaN(num)) val = num;
+                    }
+                }
+                if (val !== '') row[ci] = val;
+            }
+            if (row.length) rows[rowIdx] = row;
+        }
+        /* 中间可能有整行为空，补齐成规整的二维数组 */
+        var out = [];
+        for (var i = 0; i < rows.length; i++) out.push(rows[i] || []);
+        return out;
+    }
+
+    /* ---------- 对外接口 ---------- */
+
+    function read(data) {
+        var zip = unzip(data);
+        /* 共享字符串表不一定存在，也可能叫别的名字，找不到就当空表 */
+        var shared = [];
+        for (var i = 0; i < zip.names.length; i++) {
+            if (/^xl\/sharedStrings\.xml$/i.test(zip.names[i])) {
+                var sb = zip.bytes(zip.names[i]);
+                if (sb) shared = parseSharedStrings(bytesToText(sb));
+                break;
+            }
+        }
+        /* 工作表按 workbook 里的顺序取；退化情形下直接找第一个 sheetN.xml */
+        var sheetNames = [], sheets = {};
+        for (var j = 0; j < zip.names.length; j++) {
+            if (/^xl\/worksheets\/sheet\d+\.xml$/i.test(zip.names[j])) {
+                var key = zip.names[j].replace(/^xl\/worksheets\//i, '');
+                sheetNames.push(key);
+                sheets[key] = parseSheet(bytesToText(zip.bytes(zip.names[j])), shared);
+            }
+        }
+        sheetNames.sort();
+        if (!sheetNames.length) throw new Error('xlsx: 没有找到工作表');
+        return { SheetNames: sheetNames, Sheets: sheets };
+    }
+
+    window.XLSX = {
+        read: read,
+        utils: {
+            sheet_to_json: function (sheet) {
+                /* 只需要 header:1 这一种形态：按行返回二维数组 */
+                return sheet || [];
+            }
+        }
+    };
+})();
+    </script>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@500;700&family=Noto+Sans+SC:wght@700;900&display=swap');
 
         :root {
             --primary-color: #d84315;
@@ -144,6 +465,13 @@
         .menu-title { font-size: 2rem; color: var(--primary-color); margin: 0; display: flex; align-items: center; gap: 15px;}
         .class-title-badge { font-size: 1.2rem; background: #eee; color: #555; padding: 2px 10px; border-radius: 4px; font-weight: normal;}
         .close-menu { cursor: pointer; color: #888; font-weight: bold; }
+        .menu-actions { display: flex; gap: 10px; margin: -12px 0 16px 0; }
+        .menu-action { cursor: pointer; font-size: 0.85rem; color: #777;
+                       border: 1px solid #ddd; border-radius: 4px;
+                       padding: 3px 12px; letter-spacing: 1px;
+                       transition: color 0.2s, border-color 0.2s; }
+        .menu-action:hover { color: var(--primary-color);
+                             border-color: var(--primary-color); }
         .mode-control-area { background: #f9f9f9; padding: 15px; border-radius: 8px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; border-left: 5px solid var(--primary-color); }
         .mode-switch-btn { padding: 10px 25px; border: 2px solid var(--primary-color); background: transparent; color: var(--primary-color); font-weight: bold; cursor: pointer; transition: all 0.3s; }
         .mode-switch-btn:hover { background: var(--primary-color); color: white; }
@@ -344,6 +672,10 @@
         html[data-theme="at"] .menu-title { color: #ffffff; }
         html[data-theme="at"] .class-title-badge { background: rgba(255,255,255,0.1); color: #dce3f0; }
         html[data-theme="at"] .close-menu { color: #cfd7e6; }
+        html[data-theme="at"] .menu-action { color: #9fb0c8;
+            border-color: rgba(255,255,255,0.16); }
+        html[data-theme="at"] .menu-action:hover {
+            color: var(--primary-color); border-color: var(--primary-color); }
         html[data-theme="at"] .close-menu:hover { color: #fff; }
         html[data-theme="at"] .mode-control-area { background: rgba(255,255,255,0.05); }
         html[data-theme="at"] .mode-switch-btn { color: #e4eaf5; border-color: var(--primary-color); }
@@ -514,10 +846,11 @@
     <div class="startup-screen hidden" id="startupScreen" style="display: none;">
         <div class="startup-box">
             <h1>数据装载节点</h1>
+            <button class="class-btn" id="resumeLastBtn" style="display:none"></button>
 @@ROSTER_BTN@@
             <input type="file" id="excelUpload" accept=".xls,.xlsx" style="display:none">
             <button class="class-btn" onclick="document.getElementById('excelUpload').click()">[ 外部数据源导入 ]</button>
-            <div style="font-size:0.85rem; color:#888; margin-top:15px; letter-spacing: 1px;">*格式约束：首列序列号，次列标识名</div>
+            <div style="font-size:0.85rem; color:#888; margin-top:15px; letter-spacing: 1px;">*格式约束：首列为序号，次列为姓名</div>
         </div>
     </div>
 <!--@/MOD-->
@@ -614,6 +947,10 @@
             <div class="menu-header">
                 <h2 class="menu-title">SYSTEM CONFIG <span class="class-title-badge" id="currentClassBadge">A2班</span></h2>
                 <div class="close-menu" id="closeMenuBtn">╳ ESC</div>
+            </div>
+            <div class="menu-actions">
+                <div class="menu-action" id="switchClassBtn">切换班级</div>
+                <div class="menu-action" id="clearSaveBtn">清除本机记录</div>
             </div>
 <!--@MOD:modeswitch-->
             <div class="mode-control-area">
@@ -872,6 +1209,155 @@
 
         let studentsData = []; let fixedPositions = {}; let currentMode = 'random'; 
         let isExperimentalEnabled = false; let classNameStr = "班级"; let glitchProbability = 0.05; 
+        /* ---------- 本机存档 ----------
+           名单本身内置于文件中，而统计次数、概率权重与顺位设定是使用过程中
+           逐渐累积的，刷新一次即归零未免可惜。这里按班级名记录在本机，
+           下次装载同一班级时自动接续。存留仅限本机，不会上传，
+           设置菜单中可随时清除。*/
+        const SAVE_KEY = 'acoc.namepicker.save.v1';
+        const SAVE_MAX = 8;          // 最多保留几个班级，超出就淘汰最旧的
+        let lastSavedJson = '';
+
+        function readStore() {
+            try { return JSON.parse(localStorage.getItem(SAVE_KEY)) || {}; }
+            catch (e) { return {}; }
+        }
+
+        function writeStore(obj) {
+            /* 无痕模式或配额用尽时会抛异常，此时静默降级为不留档 */
+            try { localStorage.setItem(SAVE_KEY, JSON.stringify(obj)); return true; }
+            catch (e) { return false; }
+        }
+
+        function snapshotState() {
+            return {
+                className: classNameStr, students: studentsData,
+                fixed: fixedPositions, mode: currentMode, glitch: glitchProbability
+            };
+        }
+
+        function saveState() {
+            if (!classNameStr || !studentsData.length) return;
+            const json = JSON.stringify(snapshotState());
+            if (json === lastSavedJson) return;
+            const store = readStore();
+            if (!store.classes) store.classes = {};
+            const rec = JSON.parse(json);
+            rec.at = Date.now();
+            store.classes[classNameStr] = rec;
+            store.last = classNameStr;
+            const names = Object.keys(store.classes);
+            if (names.length > SAVE_MAX) {
+                names.sort((a, b) => (store.classes[a].at || 0) - (store.classes[b].at || 0));
+                while (names.length > SAVE_MAX) delete store.classes[names.shift()];
+            }
+            if (writeStore(store)) lastSavedJson = json;
+        }
+
+        /* 名单以文件中内置的为准，此处只回填累积下来的状态 */
+        function restoreState(name) {
+            const store = readStore();
+            const rec = store.classes && store.classes[name];
+            if (!rec) return false;
+            const byId = {};
+            (rec.students || []).forEach(s => { byId[s.id] = s; });
+            studentsData.forEach(s => {
+                const old = byId[s.id];
+                if (!old) return;
+                if (typeof old.count === 'number') s.count = old.count;
+                if (typeof old.weight === 'number') s.weight = old.weight;
+                if (typeof old.locked === 'boolean') s.locked = old.locked;
+                if (typeof old.tempExcluded === 'boolean') s.tempExcluded = old.tempExcluded;
+                if (typeof old.scenarioExcluded === 'boolean') s.scenarioExcluded = old.scenarioExcluded;
+            });
+            if (rec.fixed && typeof rec.fixed === 'object') fixedPositions = rec.fixed;
+            if (typeof rec.mode === 'string') currentMode = rec.mode;
+            if (typeof rec.glitch === 'number') glitchProbability = rec.glitch;
+            return true;
+        }
+
+        function clearSave() {
+            try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* 没用过就算了 */ }
+            lastSavedJson = '';
+        }
+
+        function savedClassName() {
+            const store = readStore();
+            return store.last && store.classes && store.classes[store.last]
+                   ? store.last : '';
+        }
+
+        /* 存档以班级名为键，装载按钮的文字同样是班级名，据此对应 */
+        function presetButtonFor(name) {
+            const clean = name.replace(/\s*\(预设\)$/, '');
+            const btns = document.querySelectorAll('#startupScreen .class-btn');
+            for (let i = 0; i < btns.length; i++) {
+                const label = btns[i].textContent.replace(/^装载预设\s*/, '').trim();
+                if (!label) continue;
+                if (label === name || label === clean) return btns[i];
+            }
+            return null;
+        }
+
+        function refreshResumeButton() {
+            const btn = document.getElementById('resumeLastBtn');
+            if (!btn) return;
+            const name = savedClassName();
+            const target = name ? presetButtonFor(name) : null;
+            if (target) {
+                btn.textContent = '继续上次 · ' + name.replace(/\s*\(预设\)$/, '');
+                btn.style.display = '';
+            } else {
+                btn.style.display = 'none';
+            }
+        }
+
+        (function wireClassControls() {
+            const switchBtn = document.getElementById('switchClassBtn');
+            const clearBtn = document.getElementById('clearSaveBtn');
+            /* index.html 中没有 FEATURES（由配置器生成时注入），
+               此时按全功能处理；生成物中若关闭了装载节点则隐藏该入口 */
+            const rosterOn = (typeof FEATURES === 'undefined') || FEATURES.roster;
+            if (switchBtn) {
+                if (!rosterOn) {
+                    switchBtn.style.display = 'none';
+                } else {
+                    switchBtn.addEventListener('click', () => {
+                        document.getElementById('closeMenuBtn').click();
+                        const screen = document.getElementById('startupScreen');
+                        if (!screen) return;
+                        refreshResumeButton();
+                        screen.style.display = 'flex';
+                        setTimeout(() => screen.classList.remove('hidden'), 30);
+                        updateLog('AWAITING DATA NODE SELECTION.');
+                    });
+                }
+            }
+            if (clearBtn) {
+                clearBtn.addEventListener('click', () => {
+                    if (!confirm('清除本机保存的统计、概率与顺位记录？此操作无法撤销。')) return;
+                    clearSave();
+                    refreshResumeButton();
+                    updateLog('LOCAL ARCHIVE CLEARED.');
+                    alert('本机记录已清除。');
+                });
+            }
+            const resumeBtn = document.getElementById('resumeLastBtn');
+            if (resumeBtn) {
+                resumeBtn.addEventListener('click', () => {
+                    const target = presetButtonFor(savedClassName());
+                    if (target) target.click();
+                });
+            }
+            refreshResumeButton();
+        })();
+
+        /* 抽取、权重与顺位都会改变这份快照；与其在各处埋设钩子，
+           不如定期比对，仅在内容变化时落盘 */
+        setInterval(saveState, 2000);
+        window.addEventListener('pagehide', saveState);
+        window.addEventListener('beforeunload', saveState);
+
         let currentTheme = document.documentElement.getAttribute('data-theme') || 'at';
         let isThemeSwitching = false;
         const MODE_COLORS = {
@@ -933,7 +1419,7 @@
         function initSystemData(rawArray, name) {
             classNameStr = name; { const badge = document.getElementById('currentClassBadge'); if (badge) badge.textContent = classNameStr; }
             studentsData = rawArray.map(s => ({ ...s, count: 0, locked: false, tempExcluded: false, scenarioExcluded: false, weight: 100 / rawArray.length }));
-            fixedPositions = {}; ITEM_HEIGHT_PX = refItemHeight(); totalHeight = studentsData.length * ITEM_HEIGHT_PX;
+            fixedPositions = {}; restoreState(name); ITEM_HEIGHT_PX = refItemHeight(); totalHeight = studentsData.length * ITEM_HEIGHT_PX;
             
             let html = ''; for(let k=0; k<2; k++) { studentsData.forEach(s => html += `<div class="student-item" data-id="${s.id}">${s.name}</div>`); }
             nameListEl.innerHTML = html;
@@ -948,6 +1434,7 @@
             fadeComponents.forEach(el => el.classList.remove('ui-hidden'));
             applyModeColors();
             updateModeUI();
+            saveState();
         }
 
 /*@MOD:roster*/

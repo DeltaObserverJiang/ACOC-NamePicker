@@ -165,7 +165,7 @@ elapsed = time.time() - t0
 check("安装已完成", ok, "%.2f 秒" % elapsed)
 check("耗时不少于两秒", elapsed >= 2.0, "实测 %.2f 秒" % elapsed)
 check("没有弹出确认页（按钮直接走到完成）", ok)
-check("写入注册表 0.2.1", stored_version() == "0.2.1", str(stored_version()))
+check("写入注册表 0.3", stored_version() == "0.3", str(stored_version()))
 close_finish(main)
 kill_app()
 
@@ -187,7 +187,7 @@ if seen:
     check("再次进入确认页", wait_btn(main, "覆盖安装", timeout=4))
     click(main, kInstallBtn)         # 覆盖安装
     check("覆盖后完成", wait_btn(main, "完成", timeout=15))
-check("覆盖后版本仍为 0.2.1", stored_version() == "0.2.1", str(stored_version()))
+check("覆盖后版本仍为 0.3", stored_version() == "0.3", str(stored_version()))
 check("程序文件在位",
       os.path.isfile(os.path.join(INSTALL, "ACOCConfigurator.exe")))
 close_finish(main)
@@ -203,6 +203,32 @@ click(main, kCancelBtn)
 time.sleep(0.5)
 u32.PostMessageW(main, 0x0010, 0, 0)   # WM_CLOSE
 time.sleep(1.0)
+
+def app_running():
+    o = subprocess.run(["tasklist", "/FI", "IMAGENAME eq ACOCConfigurator.exe",
+                        "/FO", "CSV", "/NH"], capture_output=True, text=True,
+                       encoding="gbk", errors="replace")
+    return "ACOCConfigurator" in o.stdout
+
+
+print("=== 点名器正开着：应提示并代为关闭 ===")
+kill_app()
+subprocess.Popen([os.path.join(INSTALL, "ACOCConfigurator.exe")], cwd=INSTALL)
+time.sleep(3.0)
+check("点名器已启动", app_running())
+p = launch()
+main = find_window(p.pid, "AcocSetup", TITLE)
+click(main, kInstallBtn)
+seen = wait_btn(main, "结束并安装", timeout=8)
+check("按钮变成“结束并安装”", seen, repr(text_of(main, kInstallBtn)))
+if seen:
+    click(main, kInstallBtn)
+    check("安装完成", wait_btn(main, "完成", timeout=25))
+time.sleep(1.0)
+check("运行中的实例已被关闭", not app_running())
+check("覆盖后版本仍为 0.3", stored_version() == "0.3", str(stored_version()))
+close_finish(main)
+kill_app()
 
 print("=== 收尾：卸载 ===")
 up = subprocess.Popen([os.path.join(INSTALL, "uninstall.exe")], cwd=INSTALL)

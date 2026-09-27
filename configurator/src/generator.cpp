@@ -133,18 +133,18 @@ bool Build(const std::string& tpl, const Config& c, std::string& out,
     f["modeswitch"] = f["deduct"] || f["multi"] || f["char"];
 
     if (c.classes.empty()) {
-        err = "还没有建班级。";
+        err = "尚未创建任何班级。";
         return false;
     }
     for (size_t i = 0; i < c.classes.size(); i++) {
         if (c.classes[i].students.size() < 2) {
             err = c.classes[i].name.empty()
-                      ? "第 " + std::to_string(i + 1) + " 个班级里至少要有 2 个人。"
-                      : "「" + c.classes[i].name + "」里至少要有 2 个人。";
+                      ? "第 " + std::to_string(i + 1) + " 个班级中至少需要 2 名学生。"
+                      : "「" + c.classes[i].name + "」中至少需要 2 名学生。";
             return false;
         }
         if (c.classes[i].name.empty()) {
-            err = "第 " + std::to_string(i + 1) + " 个班级还没有名字。";
+            err = "第 " + std::to_string(i + 1) + " 个班级尚未命名。";
             return false;
         }
     }
@@ -161,8 +161,8 @@ bool Build(const std::string& tpl, const Config& c, std::string& out,
     }
     feats += "}";
 
-    // 每个班级一个按钮。外面这层必须能滚：startup-box 没有 max-height，
-    // 而 body 是 overflow:hidden，班级一多按钮会溢出视口且滚不回来。
+    // 每个班级一个按钮。外层容器必须可滚动：startup-box 未设 max-height，
+    // 而 body 是 overflow:hidden，班级一多按钮会溢出视口且无法滚回。
     std::string btn;
     btn += Pad(12) + "<div style=\"max-height:44vh; overflow-y:auto; "
                      "margin:0 -4px; padding:0 4px;\">\n";
@@ -183,7 +183,7 @@ bool Build(const std::string& tpl, const Config& c, std::string& out,
     std::string tail;
     tail += Pad(12) + "setTimeout(() => {\n";
     tail += Pad(16) + "overlay.remove();\n";
-    // 模板里徽标写着原版的 A2班，先按默认班级修正，免得启动瞬间闪一下旧名字
+    // 模板中的徽标沿用了原版的 A2班，先按默认班级改写，避免启动瞬间闪现旧名
     tail += Pad(16) + "const classBadge = document.getElementById('currentClassBadge');\n";
     tail += Pad(16) + "if (classBadge) classBadge.textContent = CLASS_NAME;\n";
     tail += Pad(16) + "if (FEATURES.roster) {\n";

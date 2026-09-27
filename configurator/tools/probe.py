@@ -34,13 +34,32 @@ setTimeout(function () {
         // 多班级：预设数组、按钮数量，以及点下去是否真的换班
         r.presets = (typeof CLASS_PRESETS !== 'undefined') ? CLASS_PRESETS.length : 0;
         r.presetBtns = document.querySelectorAll('[id^=loadPresetBtn]').length;
-        if (r.presets > 1) {
+        // 关掉装载节点时按钮会被裁掉，得先确认存在
+        if (r.presets > 1 && q('loadPresetBtn1')) {
             q('loadPresetBtn1').click();
             r.afterClick = classNameStr;
             r.afterClickItems =
                 document.querySelectorAll('#nameList .student-item').length;
         }
         initSystemData(CLASS_NAMES, CLASS_NAME);
+        // 本机存档：改一条统计，落盘，再读回来
+        if (typeof studentsData !== 'undefined' && studentsData.length) {
+            studentsData[0].count = 7;
+            r.saveKeyPresent = (localStorage.getItem('acoc.namepicker.save.v1') !== null);
+            saveState();
+            var rec = JSON.parse(localStorage.getItem('acoc.namepicker.save.v1'));
+            r.savedClass = rec.last;
+            r.savedCount = rec.classes[rec.last].students[0].count;
+            studentsData[0].count = 0;
+            restoreState(classNameStr);
+            r.restoredCount = studentsData[0].count;
+        }
+        // 关掉装载节点时，换班入口应当自己藏起来
+        r.switchBtnShown = (function () {
+            var b = q('switchClassBtn');
+            return !!b && b.style.display !== 'none';
+        })();
+        r.hasResumeBtn = !!q('resumeLastBtn');
         r.expBtn = document.querySelectorAll('#unlockExpBtn').length;
         r.glitch = document.querySelectorAll('#glitchProbInput').length;
         r.dataBtn = document.querySelectorAll('#exportConfigBtn').length;
