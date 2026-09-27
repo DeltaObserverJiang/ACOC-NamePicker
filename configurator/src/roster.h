@@ -26,6 +26,9 @@ bool ReadXlsx(const std::wstring& path, Sheet& sheet, std::string& err);
 // 读取 .csv / .txt，自动区分 UTF-8 与 GBK
 bool ReadCsv(const std::wstring& path, Sheet& sheet, std::string& err);
 
+// 按文本读整个文件并统一转成 UTF-8：认得 BOM、UTF-16 与 GBK
+bool ReadTextFile(const std::wstring& path, std::string& utf8, std::string& err);
+
 // 从表格里辨认学号列与姓名列。表格可能只有姓名，也可能带表头。
 Result Detect(const Sheet& sheet);
 

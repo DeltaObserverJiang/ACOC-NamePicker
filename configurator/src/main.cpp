@@ -14,6 +14,7 @@
 
 #include "features.h"
 #include "generator.h"
+#include "importer.h"
 #include "roster.h"
 
 namespace {
@@ -78,6 +79,9 @@ std::wstring g_status = L"选好功能、备妥名单，即可导出。";
 std::string g_template;
 std::vector<gen::Klass> g_classes;
 int g_curClass = 0;
+// 「从点名器导入」的来源文件。记住它，之后导出默认写回同一个文件，
+// 这样「导出 -> 用了一阵 -> 回来改 -> 再导出」不必每次重新找路径。
+std::wstring g_importPath;
 bool g_syncing = false;  // 程序性改写编辑框时，挡住随之而来的 EN_CHANGE
 
 std::vector<std::pair<std::string, bool>> g_features;
@@ -257,11 +261,15 @@ void RefreshList() {
                     " 人。双击单元格可直接修改学号或姓名。").c_str());
 }
 
-// 切换班级：先把编辑框里可能改过的名字存回原班级，再载入新班级
+// 切换班级：载入新班级的名单与名字。
+//
+// 这里刻意不调用 SyncClassName()：调用方在动 g_curClass 之前都已经自己存过了，
+// 而编辑框里的内容属于「原来的班级」。等到这里再存，g_curClass 已经指向新班级，
+// 就会把上一个班级的名字写到新班级头上——新建班级会继承旧名，
+// 删除班级会把被删的名字（甚至删完后的邻班）覆盖掉。
 void SelectClass(int idx) {
     if (g_classes.empty()) return;
     if (idx < 0 || idx >= static_cast<int>(g_classes.size())) return;
-    SyncClassName();
     if (g_cellEdit) CommitCellEdit(false);
     g_curClass = idx;
     g_syncing = true;
@@ -326,6 +334,70 @@ void Import(bool csv) {
     LoadSheet(sheet, file);
 }
 
+// ---------- 从点名器导入 ----------
+
+std::wstring FileNameOf(const std::wstring& path) {
+    size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+// 反向走一遍生成过程：把导出的 HTML 里的班级与名单读回工作区，
+// 并记住来源文件，之后导出默认覆盖回它。
+void ImportFromHtml() {
+    std::wstring filter =
+        W("点名器页面 (*.html;*.htm)\0*.html;*.htm\0所有文件 (*.*)\0*.*\0\0");
+    wchar_t file[MAX_PATH] = L"";
+    if (!g_importPath.empty())
+        wcsncpy(file, g_importPath.c_str(), MAX_PATH - 1);
+
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_main;
+    ofn.lpstrFilter = filter.c_str();
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = L"html";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    ofn.lpstrTitle = L"选择点名器导出的 HTML";
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    std::vector<gen::Klass> classes;
+    std::string err;
+    if (!imp::ImportFile(file, classes, err)) {
+        MessageBoxW(g_main, W(err).c_str(), L"导入失败", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // 工作区里已经有名单时先问一声：导入是用文件里的班级整个替换掉
+    bool hasData = false;
+    for (const auto& k : g_classes)
+        if (!k.students.empty()) {
+            hasData = true;
+            break;
+        }
+    if (hasData) {
+        std::wstring ask = L"导入会用文件里的 " + std::to_wstring(classes.size()) +
+                           L" 个班级替换当前工作区的 " +
+                           std::to_wstring(g_classes.size()) + L" 个班级。\n\n继续吗？";
+        if (MessageBoxW(g_main, ask.c_str(), L"确认导入",
+                        MB_YESNO | MB_ICONQUESTION) != IDYES)
+            return;
+    }
+
+    if (g_cellEdit) CommitCellEdit(false);
+    g_classes.swap(classes);
+    g_curClass = 0;
+    g_importPath = file;
+
+    size_t total = 0;
+    for (const auto& k : g_classes) total += k.students.size();
+    RefreshClassList();
+    SelectClass(0);
+    SetStatus("已从 " + U8(FileNameOf(file)) + " 导入 " +
+              std::to_string(g_classes.size()) + " 个班级、共 " +
+              std::to_string(total) + " 人。导出时会默认写回该文件。");
+}
+
 // ---------- 导出 ----------
 
 bool ReadTemplate() {
@@ -351,14 +423,25 @@ void Export() {
         return;
     }
 
-    std::wstring suggest =
-        (g_classes.empty() ? std::wstring(L"点名器")
-                           : W(g_classes[0].name)) +
-        L"_点名系统.html";
+    // 从点名器导入过就默认写回那个文件，否则按班级名另起一个
+    std::wstring suggest;
+    if (!g_importPath.empty()) {
+        suggest = g_importPath;
+    } else {
+        suggest = (g_classes.empty() ? std::wstring(L"点名器")
+                                     : W(g_classes[0].name)) +
+                  L"_点名系统.html";
+    }
     std::wstring filter = W("网页文件 (*.html)\0*.html\0所有文件 (*.*)\0*.*\0\0");
     wchar_t file[MAX_PATH];
     wcsncpy(file, suggest.c_str(), MAX_PATH - 1);
     file[MAX_PATH - 1] = 0;
+
+    std::wstring initDir;
+    if (!g_importPath.empty()) {
+        size_t slash = g_importPath.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) initDir = g_importPath.substr(0, slash);
+    }
 
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
@@ -366,6 +449,7 @@ void Export() {
     ofn.lpstrFilter = filter.c_str();
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrInitialDir = initDir.empty() ? nullptr : initDir.c_str();
     ofn.lpstrDefExt = L"html";
     ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
     ofn.lpstrTitle = L"导出点名器";
@@ -605,6 +689,7 @@ void BuildPage2() {
         {"添加", 228, 60, 6102},            {"删除", 296, 60, 6103},
         {"上移", 364, 60, 6104},            {"下移", 432, 60, 6105},
         {"重新编号", 0, 88, 6106},          {"清空", 96, 60, 6107},
+        {"从点名器导入", 164, 128, 6108},
     };
     for (const auto& b : btns) {
         int y = (b.id >= 6106) ? 106 : 74;
@@ -636,8 +721,11 @@ void BuildPage2() {
         g_rosterNote,
         L"表格形态不限：仅姓名一列、学号与姓名两列，或首行为“学号 / 姓名”表头均可。");
 
+    // 走 SelectClass 而不是只刷新列表：它会把「班级名称」编辑框填上当前班级的名字。
+    // 否则启动后这个框是空的（只有占位提示），而数据里叫「我的班级」，
+    // 头一次 SyncClassName 就会把名字清成空串，导出时报「尚未命名」。
     RefreshClassList();
-    RefreshList();
+    SelectClass(0);
 }
 
 void SetPage(int page) {
@@ -842,7 +930,7 @@ void OnCommand(HWND h, int id, int code, HWND ctl) {
         return;
     }
 
-    if (code != BN_CLICKED || id < 6100 || id > 6107) return;
+    if (code != BN_CLICKED || id < 6100 || id > 6108) return;
 
     switch (id) {
         case 6100:
@@ -850,6 +938,9 @@ void OnCommand(HWND h, int id, int code, HWND ctl) {
             break;
         case 6101:
             Import(true);
+            break;
+        case 6108:
+            ImportFromHtml();
             break;
         case 6102: {
             roster::Student s;
@@ -981,7 +1072,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
             // 版本号放标题条右端，下面那行留给导出按钮
             RECT ver = {rc.right - S(130), S(20), rc.right - S(24), S(44)};
-            DrawTextC(dc, L"v0.3", ver, kMuted, g_fSmall,
+            DrawTextC(dc, L"v0.4", ver, kMuted, g_fSmall,
                       DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
             EndPaint(h, &ps);
@@ -1048,8 +1139,11 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     // 但那时选中的就是 g_curClass 本身，天然被挡掉
                     if ((nv->uNewState & LVIS_SELECTED) &&
                         !(nv->uOldState & LVIS_SELECTED) && nv->iItem >= 0 &&
-                        nv->iItem != g_curClass)
+                        nv->iItem != g_curClass) {
+                        // 点列表换班：编辑框里可能改过名字，先存回原来的班级
+                        SyncClassName();
                         SelectClass(nv->iItem);
+                    }
                 } else if (nh->code == NM_DBLCLK) {
                     SetFocus(g_className);
                     SendMessageW(g_className, EM_SETSEL, 0, -1);

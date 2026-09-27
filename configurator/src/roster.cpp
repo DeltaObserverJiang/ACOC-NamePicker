@@ -321,6 +321,41 @@ std::string Trim(const std::string& s) {
     return clean;
 }
 
+bool ReadTextFile(const std::wstring& path, std::string& utf8, std::string& err) {
+    std::vector<uint8_t> raw;
+    if (!ReadFileBytes(path, raw)) {
+        err = "无法读取文件。";
+        return false;
+    }
+    if (raw.empty()) {
+        err = "文件是空的。";
+        return false;
+    }
+    if (raw.size() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE) {
+        std::wstring w(reinterpret_cast<const wchar_t*>(raw.data() + 2),
+                       (raw.size() - 2) / 2);
+        utf8 = ToUtf8(w);
+    } else if (raw.size() >= 2 && raw[0] == 0xFE && raw[1] == 0xFF) {
+        std::wstring w;
+        w.reserve((raw.size() - 2) / 2);
+        for (size_t i = 2; i + 1 < raw.size(); i += 2)
+            w += static_cast<wchar_t>((raw[i] << 8) | raw[i + 1]);
+        utf8 = ToUtf8(w);
+    } else {
+        size_t start =
+            (raw.size() >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF)
+                ? 3 : 0;
+        std::vector<uint8_t> body(raw.begin() + start, raw.end());
+        utf8 = LooksLikeUtf8(body) ? std::string(body.begin(), body.end())
+                                   : ToUtf8(FromCodePage(body, 936));
+    }
+    if (utf8.empty()) {
+        err = "文件里没有可用的文本。";
+        return false;
+    }
+    return true;
+}
+
 bool ReadXlsx(const std::wstring& path, Sheet& sheet, std::string& err) {
     std::vector<uint8_t> raw;
     if (!ReadFileBytes(path, raw)) {

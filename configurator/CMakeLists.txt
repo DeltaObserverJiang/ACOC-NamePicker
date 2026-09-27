@@ -12,6 +12,7 @@ endif()
 set(APP_SOURCES
     src/main.cpp
     src/generator.cpp
+    src/importer.cpp
     src/roster.cpp
     src/zipfile.cpp
 )
