@@ -68,8 +68,8 @@ const COLORREF kSoft = RGB(0xf3, 0xf5, 0xfb);
 // ---------- 全局状态 ----------
 
 HINSTANCE g_inst;
-HWND g_main, g_page[2], g_nav[2], g_export, g_list, g_className, g_rosterInfo,
-    g_rosterNote, g_classList;
+HWND g_main, g_page[3], g_nav[3], g_export, g_list, g_className, g_rosterInfo,
+    g_rosterNote, g_classList, g_updateNote;
 HFONT g_fBody, g_fSmall, g_fTitle, g_fBold, g_fNav;
 HBRUSH g_bPage, g_bSide, g_bCard;
 int g_curPage = 0;
@@ -82,6 +82,8 @@ int g_curClass = 0;
 // 「从点名器导入」的来源文件。记住它，之后导出默认写回同一个文件，
 // 这样「导出 -> 用了一阵 -> 回来改 -> 再导出」不必每次重新找路径。
 std::wstring g_importPath;
+// 「点名器更新」栏最近一次选过的旧版点名器，下次打开对话框直接停在那儿
+std::wstring g_updatePath;
 bool g_syncing = false;  // 程序性改写编辑框时，挡住随之而来的 EN_CHANGE
 
 std::vector<std::pair<std::string, bool>> g_features;
@@ -341,6 +343,27 @@ std::wstring FileNameOf(const std::wstring& path) {
     return slash == std::wstring::npos ? path : path.substr(slash + 1);
 }
 
+// 读一份点名器页面：先认特征（标题、页面里的点名器痕迹），再从里面取名单。
+// 不要求它是本配置器导出的——v0.1 起各个版本的成品都能认。
+bool LoadPickerClasses(const std::wstring& path, std::vector<gen::Klass>& classes,
+                       std::string& how, std::string& err) {
+    std::string text;
+    if (!roster::ReadTextFile(path, text, err)) return false;
+
+    std::string title, why;
+    if (!imp::LooksLikePicker(text, title, why)) {
+        err = "这个文件不像是点名器：\n" + why +
+              "\n\n请选择点名器本体（双击就能点名的那份 HTML）。";
+        return false;
+    }
+    if (!imp::ParseHtml(text, classes, err, &how)) return false;
+    if (classes.empty()) {
+        err = "认出了点名器，但里面的名单是空的。";
+        return false;
+    }
+    return true;
+}
+
 // 反向走一遍生成过程：把导出的 HTML 里的班级与名单读回工作区，
 // 并记住来源文件，之后导出默认覆盖回它。
 void ImportFromHtml() {
@@ -362,8 +385,8 @@ void ImportFromHtml() {
     if (!GetOpenFileNameW(&ofn)) return;
 
     std::vector<gen::Klass> classes;
-    std::string err;
-    if (!imp::ImportFile(file, classes, err)) {
+    std::string err, how;
+    if (!LoadPickerClasses(file, classes, how, err)) {
         MessageBoxW(g_main, W(err).c_str(), L"导入失败", MB_OK | MB_ICONWARNING);
         return;
     }
@@ -395,7 +418,7 @@ void ImportFromHtml() {
     SelectClass(0);
     SetStatus("已从 " + U8(FileNameOf(file)) + " 导入 " +
               std::to_string(g_classes.size()) + " 个班级、共 " +
-              std::to_string(total) + " 人。导出时会默认写回该文件。");
+              std::to_string(total) + " 人（" + how + "）。导出时会默认写回该文件。");
 }
 
 // ---------- 导出 ----------
@@ -728,9 +751,223 @@ void BuildPage2() {
     SelectClass(0);
 }
 
+// ---------- 页面三：点名器更新 ----------
+//
+// 输入一份旧版点名器，输出一份最新版：名单从文件里读出来，其余一律用当前
+// 模板重写。班级名照抄原文——统计、概率与顺位是按班级名存在本机的，
+// 名字不动，换版本时自然接得上，用户不需要做任何搬运。
+
+constexpr int kUpCardW = 466, kUpCardH = 224;
+
+void SetPage(int page);  // 定义在下面，次一级入口要用
+
+std::wstring DirOf(const std::wstring& path) {
+    size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
+}
+
+std::wstring PickPickerFile(const wchar_t* title, const std::wstring& from) {
+    wchar_t file[MAX_PATH] = L"";
+    if (!from.empty()) wcsncpy(file, from.c_str(), MAX_PATH - 1);
+    std::wstring filter =
+        W("点名器页面 (*.html;*.htm)\0*.html;*.htm\0所有文件 (*.*)\0*.*\0\0");
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_main;
+    ofn.lpstrFilter = filter.c_str();
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrDefExt = L"html";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    ofn.lpstrTitle = title;
+    if (!GetOpenFileNameW(&ofn)) return {};
+    return file;
+}
+
+void NoteUpdateResult(const std::wstring& src, const std::wstring& out,
+                      const std::vector<gen::Klass>& classes,
+                      const std::string& how) {
+    if (!g_updateNote) return;
+    size_t total = 0;
+    for (const auto& k : classes) total += k.students.size();
+    std::wstring note = L"最近一次：";
+    if (!out.empty()) note += FileNameOf(src) + L" → " + FileNameOf(out);
+    else note += FileNameOf(src) + L"（只提取名单）";
+    note += L"，" + std::to_wstring(classes.size()) + L" 个班 / " +
+            std::to_wstring(total) + L" 人，依据：" + W(how);
+    SetWindowTextW(g_updateNote, note.c_str());
+}
+
+// 更新页的主流程：选一个旧版点名器，直接写出最新版
+void UpdateFromOld() {
+    std::wstring src = PickPickerFile(L"选择要更新的点名器", g_updatePath);
+    if (src.empty()) return;
+    g_updatePath = src;
+
+    std::vector<gen::Klass> classes;
+    std::string err, how;
+    if (!LoadPickerClasses(src, classes, how, err)) {
+        MessageBoxW(g_main, W(err).c_str(), L"更新失败", MB_OK | MB_ICONWARNING);
+        SetStatus("没能从这份文件里读出名单。");
+        return;
+    }
+
+    // 「最新版」= 全部功能都打开
+    gen::Config cfg;
+    for (const auto& f : g_features) cfg.features.emplace_back(f.first, true);
+
+    // 空班级带不进成品（点名器每班至少要有 2 人），跳过它并在结果里说一声
+    std::vector<gen::Klass> usable;
+    size_t dropped = 0;
+    for (const auto& k : classes) {
+        if (k.students.empty()) {
+            dropped++;
+            continue;
+        }
+        usable.push_back(k);
+    }
+    if (usable.empty()) {
+        MessageBoxW(g_main, L"这份文件里的班级都没有学生，没什么可输出的。",
+                    L"还不能更新", MB_OK | MB_ICONINFORMATION);
+        SetStatus("名单是空的，未输出。");
+        return;
+    }
+    // 先把「导不出来」的情况讲清楚，别等用户选完输出位置才看到报错
+    for (const auto& k : usable) {
+        if (k.students.size() >= 2) continue;
+        std::wstring msg = L"「" + W(k.name) + L"」只有 " +
+                           std::to_wstring(k.students.size()) +
+                           L" 名学生，点名器至少需要 2 名。\n\n"
+                           L"先到「班级名单」里补齐，再回来更新。";
+        MessageBoxW(g_main, msg.c_str(), L"还不能更新", MB_OK | MB_ICONINFORMATION);
+        SetStatus("名单人数不足，未输出。");
+        return;
+    }
+    cfg.classes = usable;
+
+    std::string html;
+    if (!gen::Build(g_template, cfg, html, err)) {
+        MessageBoxW(g_main, W(err).c_str(), L"还不能更新",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    std::wstring base = usable.empty() ? L"点名器" : W(usable[0].name);
+    std::wstring suggest = base + L"_点名系统_v0.5.html";
+    wchar_t file[MAX_PATH];
+    wcsncpy(file, suggest.c_str(), MAX_PATH - 1);
+    file[MAX_PATH - 1] = 0;
+
+    std::wstring initDir = DirOf(src);
+    std::wstring filter = W("网页文件 (*.html)\0*.html\0所有文件 (*.*)\0*.*\0\0");
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_main;
+    ofn.lpstrFilter = filter.c_str();
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrInitialDir = initDir.empty() ? nullptr : initDir.c_str();
+    ofn.lpstrDefExt = L"html";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.lpstrTitle = L"输出最新版点名器";
+    if (!GetSaveFileNameW(&ofn)) return;
+
+    std::wstring out = file;
+    HANDLE fh = CreateFileW(out.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fh == INVALID_HANDLE_VALUE) {
+        MessageBoxW(g_main, L"文件写入失败，换个位置再试一次。", L"更新失败",
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+    DWORD written = 0;
+    WriteFile(fh, html.data(), static_cast<DWORD>(html.size()), &written, nullptr);
+    CloseHandle(fh);
+
+    // 名单顺手放进工作区：想再改名单或加班级就去「班级名单」，
+    // 之后的「导出」也默认写回这份新文件。
+    g_classes = usable;
+    g_curClass = 0;
+    g_importPath = out;
+    RefreshClassList();
+    SelectClass(0);
+
+    size_t total = 0;
+    for (const auto& k : usable) total += k.students.size();
+    std::wstring msg = L"已输出到\n" + out + L"\n\n" +
+                       std::to_wstring(usable.size()) + L" 个班级、共 " +
+                       std::to_wstring(total) + L" 人（依据：" + W(how) +
+                       L"）。\n\n本机记着的统计、概率与顺位是按班级名存的，"
+                       L"班级名没有改动，最新版里接着上次继续累积。";
+    if (dropped)
+        msg += L"\n\n原文件里的 " + std::to_wstring(dropped) +
+               L" 个空班级没有写进去。";
+    NoteUpdateResult(src, out, usable, how);
+    SetStatus("更新完成，已写出最新版点名器。");
+    MessageBoxW(g_main, msg.c_str(), L"更新完成", MB_OK | MB_ICONINFORMATION);
+}
+
+// 更新页的次一级入口：只把名单取回工作区，不急着输出
+void ExtractOldRoster() {
+    std::wstring src = PickPickerFile(L"选择要提取名单的点名器", g_updatePath);
+    if (src.empty()) return;
+    g_updatePath = src;
+
+    std::vector<gen::Klass> classes;
+    std::string err, how;
+    if (!LoadPickerClasses(src, classes, how, err)) {
+        MessageBoxW(g_main, W(err).c_str(), L"提取失败", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (g_cellEdit) CommitCellEdit(false);
+    g_classes.swap(classes);
+    g_curClass = 0;
+    g_importPath = src;
+    RefreshClassList();
+    SelectClass(0);
+    NoteUpdateResult(src, std::wstring(), g_classes, how);
+    size_t total = 0;
+    for (const auto& k : g_classes) total += k.students.size();
+    SetStatus("已提取 " + std::to_string(g_classes.size()) + " 个班级、共 " +
+              std::to_string(total) + " 人（" + how + "）。");
+    SetPage(1);
+}
+
+void BuildPage3() {
+    HWND p = g_page[2];
+
+    ApplyFont(Mk(L"STATIC", "点名器更新", SS_LEFT, 18, 12, 240, 22, 6490, p),
+              g_fBold);
+    Mk(L"STATIC",
+       "选一份旧版点名器，直接输出一份最新版。名单原样搬过去，本机存档接着用。",
+       SS_LEFT, 18, 38, kUpCardW - 36, 18, 6491, p);
+    Hoverable(Mk(L"BUTTON", "选择旧版点名器 · 输出最新版",
+                 BS_OWNERDRAW | WS_TABSTOP, 18, 66, kUpCardW - 36, 36, 6500, p));
+    Mk(L"STATIC",
+       "输入是一份 HTML，输出也是一份 HTML，中间不用做别的。班级名照抄原文——"
+       "统计、概率与顺位正是按班级名记在本机的，名字不动，换版本时自然接上，"
+       "不会被清掉。",
+       SS_LEFT, 18, 112, kUpCardW - 36, 60, 6492, p);
+    Hoverable(Mk(L"BUTTON", "只提取名单，不输出", BS_OWNERDRAW | WS_TABSTOP, 18, 180,
+                 156, 28, 6501, p));
+
+    Mk(L"STATIC", "认得出的旧版本", SS_LEFT, 494, 12, 264, 18, 6493, p);
+    Mk(L"STATIC",
+       "v0.1 起各版本的成品都认：先看标题里有没有「点名」，再认页面里的点名器"
+       "痕迹，然后按内嵌的班级预设、预设装载调用或名单数组把名单取出来。",
+       SS_LEFT, 494, 34, 264, 92, 6494, p);
+    Mk(L"STATIC", "关于覆盖安装", SS_LEFT, 494, 136, 264, 18, 6495, p);
+    Mk(L"STATIC",
+       "安装包仍装在当前用户目录，直接覆盖旧版即可，不必先卸载；点名器本体是"
+       "单独一份 HTML，换版本不会动它留在本机的记录。",
+       SS_LEFT, 494, 158, 264, 92, 6496, p);
+
+    g_updateNote = Mk(L"STATIC", "还没有更新过。", SS_LEFT, 18, 262, 740, 18, 6497, p);
+}
+
 void SetPage(int page) {
     g_curPage = page;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         ShowWindow(g_page[i], page == i ? SW_SHOW : SW_HIDE);
         InvalidateRect(g_nav[i], nullptr, TRUE);
     }
@@ -765,6 +1002,10 @@ LRESULT CALLBACK PageProc(HWND hw, UINT m, WPARAM w, LPARAM l) {
                     DrawTextC(dc, c.title, t, hov ? kAccent : kInk, g_fBold,
                               DT_LEFT | DT_SINGLELINE | DT_VCENTER);
                 }
+            } else if (GetWindowLongPtrW(hw, GWLP_ID) == 902) {
+                // 更新页：把「输入 -> 输出」这块框成一张卡片
+                RECT box = {S(0), S(0), S(kUpCardW), S(kUpCardH)};
+                FillRounded(dc, box, S(8), kCard, kLine);
             }
             EndPaint(hw, &ps);
             return 0;
@@ -802,10 +1043,13 @@ LRESULT CALLBACK PageProc(HWND hw, UINT m, WPARAM w, LPARAM l) {
         }
         case WM_CTLCOLORSTATIC:
         case WM_CTLCOLORBTN: {
-            HBRUSH b = (GetWindowLongPtrW(hw, GWLP_ID) == 900) ? g_bCard : g_bPage;
+            // 第一页的卡片和第三页的更新卡片都铺卡片色，其余用页面底色
+            LONG_PTR pid = GetWindowLongPtrW(hw, GWLP_ID);
+            bool onCard = (pid == 900 || pid == 902);
+            HBRUSH b = onCard ? g_bCard : g_bPage;
             HDC dc = reinterpret_cast<HDC>(w);
             SetBkMode(dc, TRANSPARENT);
-            SetBkColor(dc, (GetWindowLongPtrW(hw, GWLP_ID) == 900) ? kCard : kPage);
+            SetBkColor(dc, onCard ? kCard : kPage);
             return reinterpret_cast<LRESULT>(b);
         }
         case WM_COMMAND:
@@ -826,8 +1070,8 @@ void RegisterClasses() {
 }
 
 void CreateChildren(HWND h) {
-    const char* navText[2] = {"功能模块", "班级名单"};
-    for (int i = 0; i < 2; i++) {
+    const char* navText[3] = {"功能模块", "班级名单", "点名器更新"};
+    for (int i = 0; i < 3; i++) {
         g_nav[i] = Hoverable(CreateWindowExW(
             0, L"BUTTON", W(navText[i]).c_str(),
             WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, S(kNavX), S(kNavY + i * kNavGap),
@@ -841,8 +1085,12 @@ void CreateChildren(HWND h) {
     g_page[1] = CreateWindowExW(0, L"AcocPage", L"",
                                 WS_CHILD | WS_CLIPCHILDREN, S(206), S(88), S(758),
                                 S(506), h, (HMENU)901, g_inst, nullptr);
+    g_page[2] = CreateWindowExW(0, L"AcocPage", L"",
+                                WS_CHILD | WS_CLIPCHILDREN, S(206), S(88), S(758),
+                                S(506), h, (HMENU)902, g_inst, nullptr);
     BuildPage1();
     BuildPage2();
+    BuildPage3();
 
     g_export = Hoverable(CreateWindowExW(0, L"BUTTON", L"导出 index.html",
                                          WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
@@ -853,8 +1101,16 @@ void CreateChildren(HWND h) {
 }
 
 void OnCommand(HWND h, int id, int code, HWND ctl) {
-    if (id == 1001 || id == 1002) {
+    if (id >= 1001 && id <= 1003) {
         if (code == BN_CLICKED) SetPage(id - 1001);
+        return;
+    }
+    if (id == 6500 && code == BN_CLICKED) {
+        UpdateFromOld();
+        return;
+    }
+    if (id == 6501 && code == BN_CLICKED) {
+        ExtractOldRoster();
         return;
     }
     if (id == 2001 && code == BN_CLICKED) {
@@ -1072,7 +1328,7 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
             // 版本号放标题条右端，下面那行留给导出按钮
             RECT ver = {rc.right - S(130), S(20), rc.right - S(24), S(44)};
-            DrawTextC(dc, L"v0.4", ver, kMuted, g_fSmall,
+            DrawTextC(dc, L"v0.5", ver, kMuted, g_fSmall,
                       DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
             EndPaint(h, &ps);
@@ -1087,8 +1343,8 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             GetWindowTextW(d->hwndItem, buf, 160);
             bool pressed = (d->itemState & ODS_SELECTED) != 0;
 
-            if (d->CtlID == 1001 || d->CtlID == 1002) {
-                bool active = (d->CtlID == 1001) == (g_curPage == 0);
+            if (d->CtlID >= 1001 && d->CtlID <= 1003) {
+                bool active = (static_cast<int>(d->CtlID) - 1001) == g_curPage;
                 bool hover = (g_hoverBtn == static_cast<int>(d->CtlID));
                 // 强调条改由主窗口统一画（要滑动的），这里只铺底和文字
                 HBRUSH bg =
@@ -1103,10 +1359,11 @@ LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 return TRUE;
             }
 
-            if (d->CtlID == 2001) {
-                COLORREF fill = pressed   ? RGB(0x10, 0x18, 0xc8)
-                                : (g_hoverBtn == 2001) ? RGB(0x2c, 0x38, 0xff)
-                                                       : kAccent;
+            if (d->CtlID == 2001 || d->CtlID == 6500) {
+                COLORREF fill = pressed ? RGB(0x10, 0x18, 0xc8)
+                                : (g_hoverBtn == static_cast<int>(d->CtlID))
+                                      ? RGB(0x2c, 0x38, 0xff)
+                                      : kAccent;
                 FillRounded(dc, r, S(7), fill, fill);
                 DrawTextC(dc, buf, r, RGB(255, 255, 255), g_fBold,
                           DT_CENTER | DT_SINGLELINE | DT_VCENTER);

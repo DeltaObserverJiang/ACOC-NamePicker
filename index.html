@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>A.C.O.C. 随机点名系统</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <script>
 /* 精简的 xlsx 读取器。
    点名器只需要「把第一张工作表的单元格原样取出来」这一件事，而 xlsx 不过是
@@ -328,6 +330,11 @@
 })();
     </script>
     <style>
+        /* 外部字体库：Oswald（拉丁、数字与界面文字）与 Noto Sans SC（中文）。
+           v0.3 为“去除外部依赖”删掉了这一行，v0.5 恢复。字重按样式里实际用到的
+           取值申请（Oswald 400/500/700，Noto Sans SC 400/700/900），
+           免得浏览器拿近似字重合成假粗体，笔画粗细就失真了。 */
+        @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;700&family=Noto+Sans+SC:wght@400;700;900&display=swap');
 
         :root {
             --primary-color: #d84315;
@@ -346,6 +353,9 @@
         }
 
         body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; font-family: 'Oswald', 'Noto Sans SC', sans-serif; background-color: var(--bg-color); }
+        /* 无衬线体的绝对控制：按钮、输入框默认会落到系统 UI 字体上，这里统一交回继承链，
+           页面里任何一处文字都只可能出自 Oswald / Noto Sans SC / 无衬线这条栈。 */
+        button, input, select, textarea, optgroup { font-family: inherit; }
 
         .bg-layer { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; background: var(--bg-image) no-repeat center center; background-size: cover; z-index: 1; opacity: 0.9; transition: opacity 0.6s ease, filter 0.6s ease; }
         .bg-tint { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 2; display: none; pointer-events: none; background: radial-gradient(ellipse 72% 88% at 27% 50%, rgba(3,4,8,0.52) 0%, rgba(3,4,8,0.22) 48%, rgba(3,4,8,0) 80%), linear-gradient(to right, rgba(3,4,8,0.26) 0%, rgba(3,4,8,0) 60%, rgba(3,4,8,0.26) 100%); }
@@ -390,7 +400,7 @@
         .startup-screen { position: fixed; inset: 0; z-index: 99999; background: rgba(253, 251, 247, 0.75); display: flex; flex-direction: column; align-items: center; justify-content: center; transition: opacity 0.5s, transform 0.5s; }
         .startup-screen.hidden { opacity: 0; pointer-events: none; transform: scale(1.05); }
         .startup-box { background: rgba(255, 255, 255, 0.95); border: 2px solid var(--primary-color); padding: 35px 45px 40px 45px; text-align: center; width: 340px; box-shadow: 0 15px 40px rgba(216, 67, 21, 0.15); clip-path: polygon(15px 0, 100% 0, 100% calc(100% - 15px), calc(100% - 15px) 100%, 0 100%, 0 15px); position: relative; }
-        .startup-box::before { content: 'SYS.INIT // A.C.O.C.'; position: absolute; top: 10px; left: 15px; font-size: 0.75rem; color: var(--primary-color); letter-spacing: 2px; font-family: 'Oswald'; font-weight: bold; }
+        .startup-box::before { content: 'SYS.INIT // A.C.O.C.'; position: absolute; top: 10px; left: 15px; font-size: 0.75rem; color: var(--primary-color); letter-spacing: 2px; font-family: 'Oswald', 'Noto Sans SC', sans-serif; font-weight: bold; }
         .startup-box h1 { color: var(--text-dark); font-size: 2rem; margin: 20px 0 25px 0; letter-spacing: 3px; font-family: 'Noto Sans SC', sans-serif; font-weight: 900; }
         .class-btn { display: block; width: 100%; margin: 10px 0; padding: 12px 20px; font-size: 1.1rem; font-weight: 700; background: #fff; border: 2px solid #ccc; color: #666; cursor: pointer; transition: all 0.3s; font-family: 'Oswald', 'Noto Sans SC', sans-serif; letter-spacing: 2px; }
         .class-btn:hover { background: #f5f5f5; border-color: #999; color: #333; }
@@ -847,9 +857,11 @@
         <div class="startup-box">
             <h1>数据装载节点</h1>
             <button class="class-btn" id="resumeLastBtn" style="display:none"></button>
-            <button class="class-btn highlight" id="loadA2Btn">装载预设 A2班</button>
-            <button class="class-btn highlight" id="loadA6Btn">装载预设 A6班</button>
-            <button class="class-btn highlight" id="loadYR3Btn">装载预设 优研三</button>
+            <div style="max-height:44vh; overflow-y:auto; margin:0 -4px; padding:0 4px;">
+                <button class="class-btn highlight" id="loadPresetBtn0">装载预设 A2班</button>
+                <button class="class-btn" id="loadPresetBtn1">装载预设 A6班</button>
+                <button class="class-btn" id="loadPresetBtn2">装载预设 优研三</button>
+            </div>
             <input type="file" id="excelUpload" accept=".xls,.xlsx" style="display:none">
             <button class="class-btn" onclick="document.getElementById('excelUpload').click()">[ 外部数据源导入 ]</button>
             <div style="font-size:0.85rem; color:#888; margin-top:15px; letter-spacing: 1px;">*格式约束：首列为序号，次列为姓名</div>
@@ -1002,6 +1014,9 @@
     <div class="theme-wipe" id="themeWipe"><i></i><i></i><i></i><span></span></div>
 
     <script>
+        /* 功能开关，由配置器写入 */
+        const FEATURES = {char: true, data: true, deduct: true, exp: true, fixed: true, glitch: true, menu: true, modeswitch: true, multi: true, other: true, prob: true, roster: true, stats: true, theme_at: true, theme_classic: true, theme_switch: true};
+
         setInterval(() => {
             const now = new Date();
             document.getElementById('decorTimestamp').textContent = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3,'0');
@@ -1151,17 +1166,25 @@
             
             updateLog('AWAITING DATA NODE SELECTION.');
 
-            setTimeout(() => { 
-                overlay.remove(); 
-                const startupScreen = document.getElementById('startupScreen');
-                startupScreen.style.display = 'flex';
-                setTimeout(() => { startupScreen.classList.remove('hidden'); }, 50);
+            setTimeout(() => {
+                overlay.remove();
+                const classBadge = document.getElementById('currentClassBadge');
+                if (classBadge) classBadge.textContent = CLASS_NAME;
+                if (FEATURES.roster) {
+                    const startupScreen = document.getElementById('startupScreen');
+                    startupScreen.style.display = 'flex';
+                    setTimeout(() => { startupScreen.classList.remove('hidden'); }, 50);
+                } else {
+                    initSystemData(CLASS_NAMES, CLASS_NAME);
+                }
             }, 400);
         }
 
         window.addEventListener('load', () => { initBootSequence(); });
 
-        const A2_NAMES = [
+        /* 班级名单：由配置器写入 */
+        const CLASS_NAME = "A2班";
+        const CLASS_NAMES = [
             { id: 1, name: "迟博熙" }, { id: 2, name: "代冰楠" }, { id: 3, name: "丁禹博" }, { id: 4, name: "段沛廷" },
             { id: 5, name: "范铭岩" }, { id: 6, name: "费蓝朵" }, { id: 7, name: "高佳逸" }, { id: 8, name: "高子淳" },
             { id: 9, name: "何佳衡" }, { id: 10, name: "黄岐舜" }, { id: 11, name: "黄子豪" }, { id: 12, name: "季言澎" },
@@ -1176,30 +1199,54 @@
             { id: 45, name: "张可贞" }, { id: 46, name: "张若昕" }, { id: 47, name: "张轼卿" }, { id: 48, name: "张涛" },
             { id: 49, name: "张庭瑞" }, { id: 50, name: "赵尹" }, { id: 51, name: "赵梓博" }, { id: 52, name: "李林岳" }
         ];
-
-        const A6_NAMES = [
-            { id: 1, name: "安思远" }, { id: 2, name: "陈存良" }, { id: 3, name: "崔芸宁" }, { id: 4, name: "董译泽" },
-            { id: 5, name: "董禹含" }, { id: 6, name: "付羽翀" }, { id: 7, name: "高楚明" }, { id: 8, name: "高兴" },
-            { id: 9, name: "韩博" }, { id: 10, name: "李虹璇" }, { id: 11, name: "李俊成" }, { id: 12, name: "李林东" },
-            { id: 13, name: "李森泽" }, { id: 14, name: "林凤娇" }, { id: 15, name: "刘德鸿" }, { id: 16, name: "刘铠硕" },
-            { id: 17, name: "刘烁" }, { id: 18, name: "刘奕麟" }, { id: 19, name: "刘胤非" }, { id: 20, name: "吕锦皓" },
-            { id: 21, name: "马颢译" }, { id: 22, name: "牟昊" }, { id: 23, name: "牟仟寻" }, { id: 24, name: "彭奕睿" },
-            { id: 25, name: "阙理奥" }, { id: 26, name: "时予然" }, { id: 27, name: "谭一然" }, { id: 28, name: "田紫涵" },
-            { id: 29, name: "王楚源" }, { id: 30, name: "王子润" }, { id: 31, name: "杨佳鑫" }, { id: 32, name: "于承煊" },
-            { id: 33, name: "于茗卉" }, { id: 34, name: "于小涵" }, { id: 35, name: "张懿轩" }, { id: 36, name: "张耘" },
-            { id: 37, name: "赵君烨" }, { id: 38, name: "赵荣轩" }, { id: 39, name: "赵天宝" }, { id: 40, name: "赵梓淇" },
-            { id: 41, name: "郑奕宸" }, { id: 42, name: "朱锋" }, { id: 43, name: "朱孝颖" }, { id: 44, name: "朱芸逸" },
-            { id: 45, name: "邹欣妍" }, { id: 46, name: "李昭莹" }
-        ];
-
-        const YR3_NAMES = [
-            { id: 1, name: "于琦" }, { id: 2, name: "王郅聪" }, { id: 3, name: "王涵" }, { id: 4, name: "王博维" },
-            { id: 5, name: "王奥琦" }, { id: 6, name: "王懿尧" }, { id: 7, name: "公祁" }, { id: 8, name: "冯竣琦" },
-            { id: 9, name: "吉利" }, { id: 10, name: "吕思泽" }, { id: 11, name: "孙司同" }, { id: 12, name: "李天瑞" },
-            { id: 13, name: "李昱达" }, { id: 14, name: "李晟源" }, { id: 15, name: "吴星锐" }, { id: 16, name: "汪令行" },
-            { id: 17, name: "沈思睿" }, { id: 18, name: "宋一赫" }, { id: 19, name: "武苏桐" }, { id: 20, name: "赵誉铭" },
-            { id: 21, name: "荆靓蕊" }, { id: 22, name: "修一" }, { id: 23, name: "高翊然" }, { id: 24, name: "隋思宇" },
-            { id: 25, name: "张嘉予" }, { id: 26, name: "马叶青" }
+        const CLASS_PRESETS = [
+            {
+                name: "A2班",
+                students: [
+                    { id: 1, name: "迟博熙" }, { id: 2, name: "代冰楠" }, { id: 3, name: "丁禹博" }, { id: 4, name: "段沛廷" },
+                    { id: 5, name: "范铭岩" }, { id: 6, name: "费蓝朵" }, { id: 7, name: "高佳逸" }, { id: 8, name: "高子淳" },
+                    { id: 9, name: "何佳衡" }, { id: 10, name: "黄岐舜" }, { id: 11, name: "黄子豪" }, { id: 12, name: "季言澎" },
+                    { id: 13, name: "姜禹赫" }, { id: 14, name: "焦子涵" }, { id: 15, name: "金晟宇" }, { id: 16, name: "荆启洲" },
+                    { id: 17, name: "阚子轩" }, { id: 18, name: "李浛菲" }, { id: 19, name: "李灏宇" }, { id: 20, name: "李嘉悦" },
+                    { id: 21, name: "林雨暄" }, { id: 22, name: "刘敬渟" }, { id: 23, name: "刘秋婷" }, { id: 24, name: "刘双语" },
+                    { id: 25, name: "刘鑫" }, { id: 26, name: "刘镇源" }, { id: 27, name: "刘祉岐" }, { id: 28, name: "刘子源" },
+                    { id: 29, name: "米泽宇" }, { id: 30, name: "戚雨荷" }, { id: 31, name: "钱榕雨" }, { id: 32, name: "乔楷睿" },
+                    { id: 33, name: "苏俊熙" }, { id: 34, name: "孙丞浩" }, { id: 35, name: "唐梓乔" }, { id: 36, name: "田丰瑄" },
+                    { id: 37, name: "田伊含" }, { id: 38, name: "王禹润" }, { id: 39, name: "吴津默" }, { id: 40, name: "许婧宸" },
+                    { id: 41, name: "杨滨旭" }, { id: 42, name: "杨斯然" }, { id: 43, name: "于飞洋" }, { id: 44, name: "詹皓然" },
+                    { id: 45, name: "张可贞" }, { id: 46, name: "张若昕" }, { id: 47, name: "张轼卿" }, { id: 48, name: "张涛" },
+                    { id: 49, name: "张庭瑞" }, { id: 50, name: "赵尹" }, { id: 51, name: "赵梓博" }, { id: 52, name: "李林岳" }
+                ]
+            },
+            {
+                name: "A6班",
+                students: [
+                    { id: 1, name: "安思远" }, { id: 2, name: "陈存良" }, { id: 3, name: "崔芸宁" }, { id: 4, name: "董译泽" },
+                    { id: 5, name: "董禹含" }, { id: 6, name: "付羽翀" }, { id: 7, name: "高楚明" }, { id: 8, name: "高兴" },
+                    { id: 9, name: "韩博" }, { id: 10, name: "李虹璇" }, { id: 11, name: "李俊成" }, { id: 12, name: "李林东" },
+                    { id: 13, name: "李森泽" }, { id: 14, name: "林凤娇" }, { id: 15, name: "刘德鸿" }, { id: 16, name: "刘铠硕" },
+                    { id: 17, name: "刘烁" }, { id: 18, name: "刘奕麟" }, { id: 19, name: "刘胤非" }, { id: 20, name: "吕锦皓" },
+                    { id: 21, name: "马颢译" }, { id: 22, name: "牟昊" }, { id: 23, name: "牟仟寻" }, { id: 24, name: "彭奕睿" },
+                    { id: 25, name: "阙理奥" }, { id: 26, name: "时予然" }, { id: 27, name: "谭一然" }, { id: 28, name: "田紫涵" },
+                    { id: 29, name: "王楚源" }, { id: 30, name: "王子润" }, { id: 31, name: "杨佳鑫" }, { id: 32, name: "于承煊" },
+                    { id: 33, name: "于茗卉" }, { id: 34, name: "于小涵" }, { id: 35, name: "张懿轩" }, { id: 36, name: "张耘" },
+                    { id: 37, name: "赵君烨" }, { id: 38, name: "赵荣轩" }, { id: 39, name: "赵天宝" }, { id: 40, name: "赵梓淇" },
+                    { id: 41, name: "郑奕宸" }, { id: 42, name: "朱锋" }, { id: 43, name: "朱孝颖" }, { id: 44, name: "朱芸逸" },
+                    { id: 45, name: "邹欣妍" }, { id: 46, name: "李昭莹" }
+                ]
+            },
+            {
+                name: "优研三",
+                students: [
+                    { id: 1, name: "于琦" }, { id: 2, name: "王郅聪" }, { id: 3, name: "王涵" }, { id: 4, name: "王博维" },
+                    { id: 5, name: "王奥琦" }, { id: 6, name: "王懿尧" }, { id: 7, name: "公祁" }, { id: 8, name: "冯竣琦" },
+                    { id: 9, name: "吉利" }, { id: 10, name: "吕思泽" }, { id: 11, name: "孙司同" }, { id: 12, name: "李天瑞" },
+                    { id: 13, name: "李昱达" }, { id: 14, name: "李晟源" }, { id: 15, name: "吴星锐" }, { id: 16, name: "汪令行" },
+                    { id: 17, name: "沈思睿" }, { id: 18, name: "宋一赫" }, { id: 19, name: "武苏桐" }, { id: 20, name: "赵誉铭" },
+                    { id: 21, name: "荆靓蕊" }, { id: 22, name: "修一" }, { id: 23, name: "高翊然" }, { id: 24, name: "隋思宇" },
+                    { id: 25, name: "张嘉予" }, { id: 26, name: "马叶青" }
+                ]
+            }
         ];
 
         const MODE_INFO = {
@@ -1256,11 +1303,23 @@
             if (writeStore(store)) lastSavedJson = json;
         }
 
+        /* 存档以班级名为键。v0.3 / v0.4 的预设名带「 (预设)」后缀，而新版配置器更新出来的
+           班级名可能不带，这里按几种写法依次找；命中即认，版本更新不该丢掉累积的统计。 */
+        function storeRecordFor(store, name) {
+            if (!store.classes) return null;
+            const keys = [name, name + ' (预设)', name.replace(/\s*\(预设\)$/, '')];
+            for (let i = 0; i < keys.length; i++) {
+                if (keys[i] && store.classes[keys[i]]) return { key: keys[i], rec: store.classes[keys[i]] };
+            }
+            return null;
+        }
+
         /* 名单以文件中内置的为准，此处只回填累积下来的状态 */
         function restoreState(name) {
             const store = readStore();
-            const rec = store.classes && store.classes[name];
-            if (!rec) return false;
+            const hit = storeRecordFor(store, name);
+            if (!hit) return false;
+            const rec = hit.rec;
             const byId = {};
             (rec.students || []).forEach(s => { byId[s.id] = s; });
             studentsData.forEach(s => {
@@ -1275,6 +1334,14 @@
             if (rec.fixed && typeof rec.fixed === 'object') fixedPositions = rec.fixed;
             if (typeof rec.mode === 'string') currentMode = rec.mode;
             if (typeof rec.glitch === 'number') glitchProbability = rec.glitch;
+            if (hit.key !== name) {
+                /* 从旧版名字继承过来的记录改挂到当前名字下，
+                   免得同一个班在存档里留下两份统计。 */
+                store.classes[name] = rec;
+                delete store.classes[hit.key];
+                store.last = name;
+                writeStore(store);
+            }
             return true;
         }
 
@@ -1419,7 +1486,7 @@
         let totalHeight = 0;
 
         function initSystemData(rawArray, name) {
-            classNameStr = name; document.getElementById('currentClassBadge').textContent = classNameStr;
+            classNameStr = name; { const badge = document.getElementById('currentClassBadge'); if (badge) badge.textContent = classNameStr; }
             studentsData = rawArray.map(s => ({ ...s, count: 0, locked: false, tempExcluded: false, scenarioExcluded: false, weight: 100 / rawArray.length }));
             fixedPositions = {}; restoreState(name); ITEM_HEIGHT_PX = refItemHeight(); totalHeight = studentsData.length * ITEM_HEIGHT_PX;
             
@@ -1431,8 +1498,7 @@
             updateLog(`DATA NODE [${classNameStr}] MOUNTED. STANDBY.`);
 
             const startup = document.getElementById('startupScreen');
-            startup.classList.add('hidden');
-            setTimeout(() => { startup.style.display = 'none'; }, 500);
+            if (startup) { startup.classList.add('hidden'); setTimeout(() => { startup.style.display = 'none'; }, 500); }
 
             fadeComponents.forEach(el => el.classList.remove('ui-hidden'));
             applyModeColors();
@@ -1440,9 +1506,10 @@
             saveState();
         }
 
-        document.getElementById('loadA2Btn').addEventListener('click', () => { initSystemData(A2_NAMES, "A2班 (预设)"); });
-        document.getElementById('loadA6Btn').addEventListener('click', () => { initSystemData(A6_NAMES, "A6班 (预设)"); });
-        document.getElementById('loadYR3Btn').addEventListener('click', () => { initSystemData(YR3_NAMES, "优研三 (预设)"); });
+        CLASS_PRESETS.forEach((p, i) => {
+            const b = document.getElementById('loadPresetBtn' + i);
+            if (b) b.addEventListener('click', () => { initSystemData(p.students, p.name); });
+        });
 
         document.getElementById('excelUpload').addEventListener('change', (e) => {
             const file = e.target.files[0]; if(!file) return; const reader = new FileReader();
@@ -1620,7 +1687,7 @@
             scrambleText(document.getElementById('displayId'), `ID: ${String(student.id).padStart(2, '0')}`, true);
             scrambleText(document.getElementById('displayName'), student.name);
             document.getElementById('displayCount').textContent = `COUNT: ${student.count}`;
-            resultPanel.classList.add('revealed'); setTimeout(() => { setListTransition('none'); }, 600); updateStatsTable();
+            resultPanel.classList.add('revealed'); setTimeout(() => { setListTransition('none'); }, 600); if (FEATURES.stats) updateStatsTable();
         }
 
         let multiDrawCount = 12; let multiColsData = []; let multiItemHeightDynamic = 0;
@@ -1956,7 +2023,7 @@
                     startBtn.style.display = 'none';
                     stopBtn.style.display = 'none';
                     charResetBtn.style.display = 'block';
-                    updateStatsTable();
+                    if (FEATURES.stats) updateStatsTable();
                 }, 400); 
             }, delay + 1000);
         }
@@ -2012,12 +2079,12 @@
         });
 
         function updateModeUI() {
-            document.getElementById('menuModeTitle').textContent = MODE_INFO[currentMode].title;
-            document.getElementById('menuModeDesc').textContent = MODE_INFO[currentMode].desc;
+            const mtEl = document.getElementById('menuModeTitle'); if (mtEl) mtEl.textContent = MODE_INFO[currentMode].title;
+            const mdEl = document.getElementById('menuModeDesc'); if (mdEl) mdEl.textContent = MODE_INFO[currentMode].desc;
 
             document.getElementById('standardModeUI').style.display = 'none';
-            document.getElementById('multiModeUI').style.display = 'none';
-            document.getElementById('charModeUI').style.display = 'none';
+            const muEl = document.getElementById('multiModeUI'); if (muEl) muEl.style.display = 'none';
+            const chEl = document.getElementById('charModeUI'); if (chEl) chEl.style.display = 'none';
             charResetBtn.style.display = 'none';
             startBtn.style.display = 'block'; startBtn.disabled = false;
             stopBtn.style.display = 'block'; stopBtn.disabled = true;
@@ -2027,7 +2094,7 @@
             const charLists = document.getElementById('charListsPanel');
             if (charLists) { charLists.style.display = 'flex'; charLists.style.opacity = '1'; }
 
-            if(currentMode === 'multi') {
+            if(currentMode === 'multi' && FEATURES.multi) {
                 document.getElementById('multiModeUI').style.display = 'flex';
                 document.getElementById('mainBtnGroup').style.display = 'none'; 
                 document.getElementById('multiSetupPanel').style.display = 'block';
@@ -2036,7 +2103,7 @@
                 
                 triggerEntranceAnimation(['#multiSetupPanel']);
                 
-            } else if (currentMode === 'char') {
+            } else if (currentMode === 'char' && FEATURES.char) {
                 document.getElementById('charModeUI').style.display = 'flex';
                 document.getElementById('mainBtnGroup').style.display = 'flex'; 
                 buildCharLists(); 
@@ -2081,7 +2148,7 @@
 
             setTimeout(() => { 
                 menuOverlay.classList.add('menu-open'); 
-                renderProbTable(); renderFixedTable(); updateStatsTable(); 
+                if (FEATURES.prob) renderProbTable(); if (FEATURES.fixed) renderFixedTable(); if (FEATURES.stats) updateStatsTable(); 
                 
                 globalCurtain.classList.remove('wipe-in');
                 globalCurtain.classList.add('wipe-out');
@@ -2212,7 +2279,7 @@
                         classNameStr = config.className || "自定义导入";
                         
                         totalHeight = studentsData.length * ITEM_HEIGHT_PX;
-                        document.getElementById('currentClassBadge').textContent = classNameStr;
+                        { const badge = document.getElementById('currentClassBadge'); if (badge) badge.textContent = classNameStr; }
                         
                         let html = ''; for(let k=0; k<2; k++) { studentsData.forEach(s => html += `<div class="student-item" data-id="${s.id}">${s.name}</div>`); }
                         nameListEl.innerHTML = html;

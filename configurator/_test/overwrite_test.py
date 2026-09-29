@@ -16,6 +16,8 @@ REG = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ACOCConfigurator"
 TITLE = "安装 A.C.O.C. 点名系统配置器"
 
 kInstallBtn, kCancelBtn, kStatus = 104, 105, 108
+# 跟着发行版本走：覆盖安装后注册表里记的版本号应当就是它
+EXPECT_VERSION = "0.5"
 
 class RECT(ctypes.Structure):
     _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
@@ -165,7 +167,7 @@ elapsed = time.time() - t0
 check("安装已完成", ok, "%.2f 秒" % elapsed)
 check("耗时不少于两秒", elapsed >= 2.0, "实测 %.2f 秒" % elapsed)
 check("没有弹出确认页（按钮直接走到完成）", ok)
-check("写入注册表 0.3", stored_version() == "0.3", str(stored_version()))
+check("写入注册表 " + EXPECT_VERSION, stored_version() == EXPECT_VERSION, str(stored_version()))
 close_finish(main)
 kill_app()
 
@@ -187,7 +189,7 @@ if seen:
     check("再次进入确认页", wait_btn(main, "覆盖安装", timeout=4))
     click(main, kInstallBtn)         # 覆盖安装
     check("覆盖后完成", wait_btn(main, "完成", timeout=15))
-check("覆盖后版本仍为 0.3", stored_version() == "0.3", str(stored_version()))
+check("覆盖后版本仍为 " + EXPECT_VERSION, stored_version() == EXPECT_VERSION, str(stored_version()))
 check("程序文件在位",
       os.path.isfile(os.path.join(INSTALL, "ACOCConfigurator.exe")))
 close_finish(main)
@@ -226,7 +228,7 @@ if seen:
     check("安装完成", wait_btn(main, "完成", timeout=25))
 time.sleep(1.0)
 check("运行中的实例已被关闭", not app_running())
-check("覆盖后版本仍为 0.3", stored_version() == "0.3", str(stored_version()))
+check("覆盖后版本仍为 " + EXPECT_VERSION, stored_version() == EXPECT_VERSION, str(stored_version()))
 close_finish(main)
 kill_app()
 

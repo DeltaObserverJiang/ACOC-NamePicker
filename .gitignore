@@ -18,6 +18,8 @@ configurator/_test/*.exe
 configurator/_test/_*.txt
 # 导入端到端跑出来的结果
 configurator/_test/import_e2e.txt
+# 点名器更新端到端跑出来的结果
+configurator/_test/update_e2e.txt
 
 # 早期做功能裁剪实验时留下的临时文件
 _*.html

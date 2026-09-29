@@ -16,7 +16,7 @@ namespace {
 constexpr int kResApp = 3;
 
 const wchar_t* kAppName = L"A.C.O.C. 点名系统配置器";
-const wchar_t* kVersion = L"0.4";
+const wchar_t* kVersion = L"0.5";
 const wchar_t* kPublisher = L"A.C.O.C.";
 const wchar_t* kExeName = L"ACOCConfigurator.exe";
 const wchar_t* kUninstName = L"uninstall.exe";

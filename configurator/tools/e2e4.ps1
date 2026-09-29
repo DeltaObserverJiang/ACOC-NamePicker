@@ -1,17 +1,32 @@
-﻿# 端到端跑一遍「从点名器导入」：开程序 -> 点导入 -> 选文件 -> 回读工作区，
-# 再点导出，确认默认文件名已经指回导入的那个文件。
-# 文件必须存成 UTF-8 带 BOM，否则 PowerShell 5.1 按 GBK 解出乱码。
-param([string]$Exe = "", [string]$Src = "")
+﻿# 端到端跑一遍「点名器更新」：开程序 -> 切到更新页 -> 选一份旧版点名器 ->
+# 直接输出最新版 -> 核对输出文件里的班级与人数，并确认名单已回到工作区。
+# 文件存成 UTF-8 带 BOM，PowerShell 5.1 才认中文。
+param([string]$Exe = "", [string]$Src = "", [string]$OutDir = "")
 
 $Repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not $Exe) { $Exe = Join-Path $Repo "configurator\build\bin\ACOCConfigurator.exe" }
-if (-not $Src) { $Src = Join-Path $Repo "configurator\_test\_all.html" }
+if (-not $OutDir) { $OutDir = Join-Path $Repo "configurator\_test" }
+if (-not $Src) { $Src = Join-Path $Repo "configurator\_test\old_v04.html" }
+$Dst = Join-Path $OutDir "updated_e2e.html"
+
+# 旧版夹具不入库（_test 下的 *.html 本就被忽略），需要时从标签里取一份 v0.4 的成品。
+# 必须走 cmd 重定向：PowerShell 的 > 会把 git 的原始字节按控制台编码重新编码，
+# 中文名字会当场烂掉。取不到就退而用当前的 index.html（同样是一份合法点名器）。
+if (-not (Test-Path $Src)) {
+  $Src = Join-Path $Repo "configurator\_test\old_v04.html"
+  Start-Process -FilePath "cmd.exe" -Wait -NoNewWindow -ArgumentList @(
+    "/c", "git -C `"$Repo`" show v0.4:index.html > `"$Src`"")
+  if (-not (Test-Path $Src)) {
+    Write-Host "取不到 v0.4 的成品，改用 index.html"
+    $Src = Join-Path $Repo "index.html"
+  }
+}
 
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
-public class B2 {
+public class B4 {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
@@ -33,7 +48,6 @@ public class B2 {
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc p, IntPtr l);
   [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int pid);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr h);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
 
   public static IntPtr FindTopDialog(IntPtr owner, int pid) {
@@ -63,7 +77,6 @@ public class B2 {
     return IntPtr.Zero;
   }
 
-  // 在整棵对话框里找第一个「可见的、类名是 cls 且里面有可见 Edit」的控件
   static IntPtr ComboEditIn(IntPtr root, string cls, int depth) {
     if (depth > 14 || root == IntPtr.Zero) return IntPtr.Zero;
     if (Cls(root) == cls && IsWindowVisible(root)) {
@@ -79,18 +92,14 @@ public class B2 {
     return IntPtr.Zero;
   }
 
-  // 「文件名」那个输入框。地址栏里也有一个 ComboBoxEx32/ComboBox，
-  // 但那是隐藏的，必须按可见性挑，否则会拿到地址栏的空框。
   public static IntPtr FindFileNameBox(IntPtr dlg) {
     IntPtr e = ComboEditIn(dlg, "ComboBoxEx32", 0);
     if (e != IntPtr.Zero) return e;
     e = ComboEditIn(dlg, "ComboBox", 0);
     if (e != IntPtr.Zero) return e;
-    // 实在没有就退回到对话框里第一个可见的 Edit
     return DeepFindVisible(dlg, "Edit", 0);
   }
 
-  // 对话框里那个默认按钮，找 id 1 或 id 2 都行
   public static IntPtr FirstButton(IntPtr dlg, params int[] ids) {
     foreach (int i in ids) {
       IntPtr b = GetDlgItem(dlg, i);
@@ -101,8 +110,6 @@ public class B2 {
 
   public static string Cls(IntPtr h) { var sb = new StringBuilder(128); GetClassName(h, sb, 128); return sb.ToString(); }
   public static string Txt(IntPtr h) { var sb = new StringBuilder(512); GetWindowText(h, sb, 512); return sb.ToString(); }
-
-  // GetWindowTextLength 对别的进程里的控件一律返回 0，只能自己给个够大的缓冲
   public static string Text(IntPtr h) {
     var sb = new StringBuilder(2048);
     SendMessage(h, 0x000D, (IntPtr)2048, sb);
@@ -112,44 +119,47 @@ public class B2 {
 "@
 
 $WM_SETTEXT = 0x000C
-# 结果同时写进一个 UTF-8 文件：控制台代码页会把中文搅成乱码，读不得
 $script:log = New-Object System.Collections.ArrayList
+$script:bad = 0
 function Note($t) { [void]$script:log.Add($t); Write-Host $t }
-$LogPath = Join-Path (Join-Path $Repo "configurator\_test") "import_e2e.txt"
+function Check($cond, $what) {
+  if ($cond) { Note ("PASS " + $what) } else { $script:bad++; Note ("FAIL " + $what) }
+}
+
+$LogPath = Join-Path $OutDir "update_e2e.txt"
 
 function ClickBtn($hwnd) {
-  # BM_CLICK 用 PostMessage 发：处理函数里可能弹模态框，
-  # SendMessage 会一直等它返回，而它正等着对话框，双方死锁。
-  [void][B2]::PostMessage($hwnd, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+  [void][B4]::PostMessage($hwnd, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
   Start-Sleep -Milliseconds 500
 }
 
 function RealClick($hwnd) {
-  $r = New-Object B2+RECT
-  [void][B2]::GetWindowRect($hwnd, [ref]$r)
-  [void][B2]::SetCursorPos([int](($r.L + $r.R) / 2), [int](($r.T + $r.B) / 2))
+  $r = New-Object B4+RECT
+  [void][B4]::GetWindowRect($hwnd, [ref]$r)
+  [void][B4]::SetCursorPos([int](($r.L + $r.R) / 2), [int](($r.T + $r.B) / 2))
   Start-Sleep -Milliseconds 120
-  [B2]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
+  [B4]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
   Start-Sleep -Milliseconds 60
-  [B2]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
+  [B4]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
   Start-Sleep -Milliseconds 400
 }
 
 function Ctl($parent, $id) {
-  $c = [B2]::GetDlgItem($parent, $id)
+  $c = [B4]::GetDlgItem($parent, $id)
   if ($c -eq [IntPtr]::Zero) { Write-Error "control $id not found"; exit 1 }
   return $c
 }
 
-# 弹出来的 MessageBox 只能用真实鼠标点，发 WM_COMMAND / BM_CLICK 都不认。
-# 参数别叫 $pid：那是 PowerShell 的只读自动变量，绑定会直接失败。
+# MessageBox 只认真实鼠标。参数别叫 $pid：那是 PowerShell 的只读自动变量
 function DismissBox($main, $owner) {
-  $dlg = [B2]::FindTopDialog($main, $owner)
+  $dlg = [B4]::FindTopDialog($main, $owner)
   if ($dlg -eq [IntPtr]::Zero) { return $false }
-  RealClick ([B2]::FirstButton($dlg, 2, 1))
+  RealClick ([B4]::FirstButton($dlg, 2, 1))
   Start-Sleep -Milliseconds 400
   return $true
 }
+
+if (Test-Path $Dst) { Remove-Item $Dst -Force }
 
 Get-Process -Name "ACOCConfigurator" -ErrorAction SilentlyContinue |
   Stop-Process -Force -ErrorAction SilentlyContinue
@@ -158,89 +168,90 @@ $proc = Start-Process -FilePath $Exe -PassThru
 Start-Sleep -Milliseconds 2200
 $main = $proc.MainWindowHandle
 if ($main -eq [IntPtr]::Zero) { $main = (Get-Process -Id $proc.Id).MainWindowHandle }
-[void][B2]::ShowWindow($main, 5)
-[void][B2]::SetForegroundWindow($main)
-Start-Sleep -Milliseconds 600
-$script:pid2 = $proc.Id
+[void][B4]::ShowWindow($main, 5)
+[void][B4]::SetForegroundWindow($main)
+Start-Sleep -Milliseconds 700
 
-ClickBtn (Ctl $main 1002)                 # 切到班级名单页
-Start-Sleep -Milliseconds 400
-$page = Ctl $main 901
-if (-not [B2]::IsWindowVisible($page)) {
-  Write-Error "没切到班级名单页，后面的点击都会落空"
+# --- 切到「点名器更新」 ---
+ClickBtn (Ctl $main 1003)
+Start-Sleep -Milliseconds 500
+$page = Ctl $main 902
+Check ([B4]::IsWindowVisible($page)) "切到点名器更新页"
+Note ("更新前提示=" + [B4]::Text((Ctl $page 6497)))
+
+# --- 点主按钮，选旧版点名器 ---
+ClickBtn (Ctl $page 6500)
+Start-Sleep -Milliseconds 2000
+$dlg = [B4]::FindTopDialog($main, $proc.Id)
+if ($dlg -eq [IntPtr]::Zero) {
+  Note "FAIL 打开对话框没出现"
   Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+  [System.IO.File]::WriteAllLines($LogPath, [string[]]$script:log,
+    (New-Object System.Text.UTF8Encoding($false)))
   exit 1
 }
-$cls = Ctl $page 6400
-$list = Ctl $page 6200
-
-Note ("导入前|班级={0}|学生={1}|班级名={2}" -f `
-  [B2]::SendMessage($cls, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero), `
-  [B2]::SendMessage($list, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero), `
-  [B2]::Text((Ctl $page 6001)))
-
-# --- 点「从点名器导入」 ---
-ClickBtn (Ctl $page 6108)
-Start-Sleep -Milliseconds 2000
-
-$dlg = [B2]::FindTopDialog($main, $proc.Id)
-if ($dlg -eq [IntPtr]::Zero) {
-  Write-Host ("诊断：main={0}；本进程可见顶层窗口：" -f $main)
-  [B2]::EnumWindows({
-    param($h, $l)
-    if (-not [B2]::IsWindowVisible($h)) { return $true }
-    $wp = 0; [void][B2]::GetWindowThreadProcessId($h, [ref]$wp)
-    if ($wp -ne $script:pid2) { return $true }
-
-    Write-Host ("  类={0} 标题='{1}' owner={2}" -f [B2]::Cls($h), [B2]::Txt($h), [B2]::GetWindow($h, 4))
-    return $true
-  }, [IntPtr]::Zero) | Out-Null
-  Write-Error "打开文件对话框没出现"; exit 1
-}
-$box = [B2]::FindFileNameBox($dlg)
-if ($box -eq [IntPtr]::Zero) { Write-Error "找不到文件名输入框"; exit 1 }
-[void][B2]::SendMessage($box, $WM_SETTEXT, [IntPtr]::Zero, $Src)
+Note ("第一个对话框标题=" + [B4]::Txt($dlg))
+$box = [B4]::FindFileNameBox($dlg)
+[void][B4]::SendMessage($box, $WM_SETTEXT, [IntPtr]::Zero, $Src)
 Start-Sleep -Milliseconds 400
-ClickBtn ([B2]::FirstButton($dlg, 1, 2))
+ClickBtn ([B4]::FirstButton($dlg, 1, 2))
+Start-Sleep -Milliseconds 2600
+
+# --- 应当出现保存对话框，且默认文件名带着第一个班级名 ---
+$sdlg = [B4]::FindTopDialog($main, $proc.Id)
+if ($sdlg -eq [IntPtr]::Zero) {
+  Note "FAIL 保存对话框没出现（多半弹了报错框）"
+  Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+  [System.IO.File]::WriteAllLines($LogPath, [string[]]$script:log,
+    (New-Object System.Text.UTF8Encoding($false)))
+  exit 1
+}
+Note ("第二个对话框标题=" + [B4]::Txt($sdlg))
+$sbox = [B4]::FindFileNameBox($sdlg)
+$sname = [B4]::Text($sbox)
+Note ("默认输出文件名=" + $sname)
+Check ($sname -like "*_点名系统_v0.5.html") "默认文件名带班级名与版本号"
+[void][B4]::SendMessage($sbox, $WM_SETTEXT, [IntPtr]::Zero, $Dst)
+Start-Sleep -Milliseconds 400
+ClickBtn ([B4]::FirstButton($sdlg, 1, 2))
 Start-Sleep -Milliseconds 1800
 
-# 工作区本来就空，不该弹确认框；真弹了就顺手点掉
-if ([B2]::FindTopDialog($main, $proc.Id) -ne [IntPtr]::Zero) { [void](DismissBox $main $proc.Id) }
-Start-Sleep -Milliseconds 800
-if ([B2]::FindTopDialog($main, $proc.Id) -ne [IntPtr]::Zero) { [void](DismissBox $main $proc.Id) }
+# --- 完成提示 ---
+$doneDlg = [B4]::FindTopDialog($main, $proc.Id)
+if ($doneDlg -ne [IntPtr]::Zero) { Note ("完成提示标题=" + [B4]::Txt($doneDlg)) }
+Check (DismissBox $main $proc.Id) "出现并关掉「更新完成」提示"
 Start-Sleep -Milliseconds 600
+Note ("更新后提示=" + [B4]::Text((Ctl $page 6497)))
 
-$clsCount = [B2]::SendMessage($cls, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero)
-$stuCount = [B2]::SendMessage($list, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero)
-$clsName = [B2]::Text((Ctl $page 6001))
-Note ("导入后|班级={0}|学生={1}|班级名={2}" -f $clsCount, $stuCount, $clsName)
+# --- 落到磁盘上的成品 ---
+Check (Test-Path $Dst) "输出了文件"
+if (Test-Path $Dst) {
+  $text = [System.IO.File]::ReadAllText($Dst, [System.Text.Encoding]::UTF8)
+  $btns = ([regex]::Matches($text, 'id="loadPresetBtn')).Count
+  Check ($text.Contains("const CLASS_PRESETS = [")) "成品里有 CLASS_PRESETS"
+  Check ($btns -eq 3) ("成品里预设按钮 3 个（实际 " + $btns + "）")
+  Check ($text.Contains("A2班 (预设)")) "班级名保持原文（带「 (预设)」）"
+  Check ($text.Contains("acoc.namepicker.save.v1")) "成品仍是同一份本机存档键"
+  Check ($text.Contains("fonts.googleapis.com")) "成品已恢复外部字体库"
+  Check ($text.Contains("const FEATURES = {")) "成品带着功能开关"
+}
 
-# 切到第二个班级看看学生表有没有跟着换
-ClickBtn (Ctl $page 6414)                 # 下移
+# --- 名单回到工作区 ---
+ClickBtn (Ctl $main 1002)
 Start-Sleep -Milliseconds 500
-Note ("下移后|班级={0}|学生={1}|班级名={2}" -f `
-  [B2]::SendMessage($cls, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero), `
-  [B2]::SendMessage($list, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero), `
-  [B2]::Text((Ctl $page 6001)))
-
-# --- 点导出，确认默认文件名指回导入的那个文件 ---
-ClickBtn (Ctl $main 2001)
-Start-Sleep -Milliseconds 2200
-$sdlg = [B2]::FindTopDialog($main, $proc.Id)
-if ($sdlg -eq [IntPtr]::Zero) { Write-Error "保存对话框没出现"; exit 1 }
-$sbox = [B2]::FindFileNameBox($sdlg)
-$sname = [B2]::Text($sbox)
-Note ("导出默认文件名={0}" -f $sname)
-# 保存对话框会直接切到源文件所在目录，文件名框里只显示文件名
-$wantName = [System.IO.Path]::GetFileName($Src)
-if ($sname -eq $wantName) { Note "源文件记忆=一致" }
-else { Note ("源文件记忆=不一致|期望=" + $wantName) }
-
-ClickBtn ([B2]::FirstButton($sdlg, 2, 1))   # 取消，不要真写出文件
-Start-Sleep -Milliseconds 600
-if ([B2]::FindTopDialog($main, $proc.Id) -ne [IntPtr]::Zero) { [void](DismissBox $main $proc.Id) }
+$page2 = Ctl $main 901
+$cls = Ctl $page2 6400
+$list = Ctl $page2 6200
+$clsCount = [B4]::SendMessage($cls, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero)
+$stuCount = [B4]::SendMessage($list, 0x1004, [IntPtr]::Zero, [IntPtr]::Zero)
+$clsName = [B4]::Text((Ctl $page2 6001))
+Note ("工作区|班级={0}|学生={1}|当前班名={2}" -f $clsCount, $stuCount, $clsName)
+Check ($clsCount -eq 3) "工作区拿到 3 个班级"
+Check ($stuCount -eq 52) "当前班 52 人"
+Check ($clsName -eq "A2班 (预设)") "当前班名与原文一致"
 
 Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
 [System.IO.File]::WriteAllLines($LogPath, [string[]]$script:log,
   (New-Object System.Text.UTF8Encoding($false)))
-Write-Host "DONE"
+Write-Host ("DONE bad=" + $script:bad)
+if ($script:bad -gt 0) { exit 1 }
